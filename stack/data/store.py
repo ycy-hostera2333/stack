@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS instruments (
     board       TEXT,
     is_st       INTEGER DEFAULT 0,
     listed_date TEXT,      -- 上市日期，用于剔除次新股
+    delisted_date TEXT,    -- 退市日期；为空表示仍在市
+    status      TEXT DEFAULT 'listed',   -- listed / delisted
     industry    TEXT,      -- 所属行业（深市官方提供，沪市可能为空）
     float_share REAL,      -- 流通股本（股）
     updated_at  TEXT
@@ -85,6 +87,12 @@ def connect():
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        # 已有库的平滑升级：老版本的 instruments 表没有退市字段
+        have = {r[1] for r in conn.execute("PRAGMA table_info(instruments)")}
+        for col, ddl in (("delisted_date", "TEXT"),
+                         ("status", "TEXT DEFAULT 'listed'")):
+            if col not in have:
+                conn.execute(f"ALTER TABLE instruments ADD COLUMN {col} {ddl}")
 
 
 # ------------------------------------------------------------------ 写入
@@ -123,8 +131,8 @@ def upsert_instruments(df: pd.DataFrame) -> int:
     """写入/更新股票基础信息。"""
     if df.empty:
         return 0
-    cols = ["code", "name", "board", "is_st", "listed_date",
-            "industry", "float_share", "updated_at"]
+    cols = ["code", "name", "board", "is_st", "listed_date", "delisted_date",
+            "status", "industry", "float_share", "updated_at"]
     df = df.reindex(columns=cols)
     with connect() as conn:
         conn.executemany(

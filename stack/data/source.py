@@ -259,6 +259,106 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
     return stats
 
 
+# ------------------------------------------------------------------ 退市股
+def _retry(fn, *a, tries: int = 4, **kw):
+    """交易所接口偶发 SSL 断连，退避重试。"""
+    for i in range(tries):
+        try:
+            return fn(*a, **kw)
+        except Exception:
+            if i == tries - 1:
+                raise
+            time.sleep(RETRY_SLEEP * (2 ** i) * (0.5 + random.random()))
+
+
+def fetch_delisted() -> pd.DataFrame:
+    """已退市股票列表。
+
+    这是修正幸存者偏差的关键：交易所的在市股票列表里没有退市股，
+    只用它建股票池，等于每次都只在"活下来的公司"里选——
+    历史回测会系统性偏乐观，小市值类因子受影响尤其大。
+    """
+    ak = _ak()
+    frames = []
+    try:
+        sh = _retry(ak.stock_info_sh_delist)
+        frames.append(pd.DataFrame({
+            "code": sh["公司代码"].astype(str).str.zfill(6),
+            "name": sh["公司简称"].astype(str).str.strip(),
+            "listed_date": sh["上市日期"].astype(str),
+            "delisted_date": sh["暂停上市日期"].astype(str),
+        }))
+    except Exception as e:
+        print(f"[warn] 上交所退市列表获取失败：{e}")
+    try:
+        sz = _retry(ak.stock_info_sz_delist, symbol="终止上市公司")
+        frames.append(pd.DataFrame({
+            "code": sz["证券代码"].astype(str).str.zfill(6),
+            "name": sz["证券简称"].astype(str).str.strip(),
+            "listed_date": sz["上市日期"].astype(str),
+            "delisted_date": sz["终止上市日期"].astype(str),
+        }))
+    except Exception as e:
+        print(f"[warn] 深交所退市列表获取失败：{e}")
+
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    out["name"] = out["name"].str.replace(r"\s+", "", regex=True)
+    for c in ("listed_date", "delisted_date"):
+        out[c] = pd.to_datetime(out[c], errors="coerce").dt.strftime("%Y-%m-%d")
+    out["board"] = out["code"].map(classify_board)
+    out["is_st"] = 1                      # 退市股基本都经历过 ST
+    out["industry"] = pd.NA
+    out["float_share"] = pd.NA
+    out["status"] = "delisted"
+    out["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    out = out[out["board"] != "未知"]
+    return out.dropna(subset=["code", "delisted_date"]).drop_duplicates(subset=["code"])
+
+
+def sync_delisted(since: str = HISTORY_START, progress=None) -> dict:
+    """同步退市股的基础信息与历史日线。
+
+    只取在本地数据窗口内还活着的（退市日 >= since）——更早退市的公司
+    在我们的回测区间里本来就不存在，取了也没用。
+    """
+    store.init_db()
+    lst = fetch_delisted()
+    if lst.empty:
+        return {"listed": 0, "synced": 0, "rows": 0}
+
+    since_iso = pd.to_datetime(since).strftime("%Y-%m-%d")
+    lst = lst[lst["delisted_date"] >= since_iso]
+    store.upsert_instruments(lst)
+
+    codes = lst["code"].tolist()
+    have = store.last_dates()
+    todo = [c for c in codes if c not in have]
+    stats = {"listed": len(lst), "pending": len(todo), "synced": 0,
+             "failed": 0, "rows": 0}
+    if not todo:
+        return stats
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futs = {pool.submit(fetch_daily, c, since): c for c in todo}
+        for fut in as_completed(futs):
+            done += 1
+            try:
+                df = fut.result()
+            except Exception:
+                df = pd.DataFrame()
+            if df.empty:
+                stats["failed"] += 1
+            else:
+                stats["rows"] += store.upsert_daily(df)
+                stats["synced"] += 1
+            if progress and done % 20 == 0:
+                progress(done, len(todo), stats)
+    return stats
+
+
 # ------------------------------------------------------------------ 指数（基准）
 # key 为带交易所前缀的新浪代码，value 为 (显示名, 本地存储代码)
 BENCHMARKS = {

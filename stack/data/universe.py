@@ -50,6 +50,15 @@ def build(flt: UniverseFilter | None = None, as_of: str | None = None) -> pd.Dat
     as_of = as_of or datetime.now().strftime("%Y-%m-%d")
     inst = inst[~inst["board"].isin(flt.board_blacklist())]
 
+    # ---- point-in-time：只保留在 as_of 当天真实存在的股票 ----
+    # 这是修正幸存者偏差的关键一步。如果只用当前在市的股票建池子，
+    # 等于每次都在"事后知道谁活下来了"的集合里选股，历史回测会系统性偏乐观。
+    # 反过来也要防止用未来信息：as_of 之后才上市的公司当时并不存在。
+    if "delisted_date" in inst.columns:
+        dl = pd.to_datetime(inst["delisted_date"], errors="coerce")
+        # 退市日晚于 as_of 的，在当时仍在交易，必须留在池子里
+        inst = inst[dl.isna() | (dl > pd.Timestamp(as_of))]
+
     if flt.exclude_st:
         inst = inst[inst["is_st"] == 0]
 

@@ -36,6 +36,30 @@ def cmd_sync(args) -> None:
         n = source.sync_instruments()
         print(f"  股票列表 {n} 只")
 
+    if args.delisted:
+        from .data import tushare_source as tsrc
+        if tsrc.available():
+            print("同步退市股（Tushare Pro，修正幸存者偏差）…")
+            try:
+                st = tsrc.sync_delisted(progress=_progress)
+            except RuntimeError as e:
+                print(f"\n  失败：{e}")
+                st = None
+            if st:
+                print(f"\n  退市股 {st['listed']} 只，待补 {st['pending']}，"
+                      f"成功 {st['synced']}，失败 {st['failed']}，"
+                      f"写入 {st['rows']:,} 行")
+        else:
+            print("同步退市股列表（免费源只有名单，没有历史行情）…")
+            st = source.sync_delisted(progress=_progress)
+            print(f"\n  退市股 {st['listed']} 只已登记，"
+                  f"行情成功 {st['synced']}/{st.get('pending',0)}")
+            print("\n  ⚠ 免费源不提供退市股历史 K 线（实测 367 只全部取不到）。")
+            print("     要真正修正幸存者偏差，需配置 Tushare token：")
+            print("     到 https://tushare.pro 注册，然后")
+            print("       set TUSHARE_TOKEN=你的token")
+            print("     或把 token 写入项目根目录的 .tushare_token 文件。")
+
     if args.index or args.daily:
         print("同步指数基准…")
         for symbol, (label, _) in source.BENCHMARKS.items():
@@ -230,6 +254,44 @@ def cmd_paper(args) -> None:
     print(f"  半年后回看时，它才是真正没被调过参的未来数据。")
 
 
+def cmd_factors(args) -> None:
+    import pandas as pd
+    from . import factors as F
+
+    print(f"构建面板：{args.start} ~ {args.end}，流动性前 {args.top} 只…")
+    P = F.build_panel(start=args.start, end=args.end, top=args.top)
+    if not P:
+        print("没有数据，先跑 sync")
+        return
+    print(f"  {P['close'].shape[0]} 个交易日 × {P['close'].shape[1]} 只\n")
+
+    if args.name:
+        r = F.evaluate(args.name, P)
+        print(f"【{r['label']}】 {args.name}   方向 {r['direction']:+d}")
+        if r["note"]:
+            print(f"  {r['note']}")
+        print(f"\n  {'持有期':<8}{'IC均值':>10}{'IC_IR':>9}{'IC>0':>8}{'样本':>7}")
+        for h, v in r["ic"].items():
+            print(f"  {h:<8}{v['mean']:>+10.4f}{v['ir']:>+9.3f}"
+                  f"{v['pos_ratio']:>8.0%}{v['n']:>7}")
+        print(f"\n  分层收益(20日): " + "  ".join(f"{x:+.2%}" for x in r["layers"]))
+        print(f"  多空价差 {r['spread']:+.2%}   单调性 {r['monotonic']:.0%}"
+              f"   换手率 {r['turnover']:.1%}")
+        return
+
+    df = F.evaluate_all(P)
+    for c in ("IC均值", "IC_IR", "多空价差", "换手率"):
+        if c in df:
+            df[c] = df[c].map(lambda v: f"{v:+.4f}" if pd.notna(v) else "—")
+    for c in ("t值", "单调性", "IC>0占比"):
+        if c in df:
+            df[c] = df[c].map(lambda v: f"{v:.2f}" if pd.notna(v) else "—")
+    print(df.to_string(index=False))
+    print("\n⚠ 表中 t 值未校正重叠窗口的自相关，会虚高 5~7 倍。")
+    print("  20 日持有期的 IC 自相关高达 0.9+，有效样本仅几十个而非上千。")
+    print("  判断显著性请用 `--name <因子>` 看逐年 IC 的一致性，而不是看 t 值。")
+
+
 def cmd_selftest(args) -> None:
     from .selftest import run_all
     print("自检：验证回测引擎的关键不变量…")
@@ -251,6 +313,8 @@ def main(argv=None) -> int:
     s.add_argument("--instruments", action="store_true", help="更新股票列表")
     s.add_argument("--daily", action="store_true", help="更新日线")
     s.add_argument("--index", action="store_true", help="更新指数基准")
+    s.add_argument("--delisted", action="store_true",
+                   help="补齐退市股历史（修正幸存者偏差，建议每季度跑一次）")
     s.add_argument("--full", action="store_true", help="重建全部历史（复权价会变，建议定期跑）")
     s.add_argument("--only-missing", action="store_true",
                    help="只补从没取到过的股票，已有数据的跳过。上游限流后专门补缺用")
@@ -288,6 +352,13 @@ def main(argv=None) -> int:
             __import__("stack.stats", fromlist=["x"]).collect()))
     sub.add_parser("selftest", help="自检：验证回测引擎的关键不变量"
                    ).set_defaults(func=cmd_selftest)
+
+    fa = sub.add_parser("factors", help="因子研究：IC 评估与分层回测")
+    fa.add_argument("--name", help="只评估指定因子，给出 IC 衰减与分层明细")
+    fa.add_argument("--start", default="2019-01-01")
+    fa.add_argument("--end", default=today)
+    fa.add_argument("--top", type=int, default=800, help="股票池取流动性前 N 只")
+    fa.set_defaults(func=cmd_factors)
 
     pp = sub.add_parser("paper", help="前向模拟盘：逐日推进的虚拟账户")
     pp.add_argument("action", choices=["init", "run", "status"],

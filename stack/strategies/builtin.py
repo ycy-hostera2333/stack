@@ -348,6 +348,90 @@ class RegimeMomentum(Strategy):
 
 
 @register
+class Defensive(Strategy):
+    name = "defensive"
+    label = "低波动防御"
+    description = (
+        "完全按因子分析的结论重建，不用动量：\n"
+        "① 低波动（vol_20）和 ② 低彩票性（近 20 日最大单日涨幅小）——"
+        "这是本地八年数据里仅有的两个**逐年 IC 全为正（8/8）**的因子；"
+        "③ 叠加短期反转（20 日涨幅越小越好），该因子八年里七年为负向有效。\n"
+        "刻意**不要求站上 MA60**：ma60_dist 因子八年里七年 IC 为负，"
+        "站得越高后续跑得越差，那是动量策略的反向假设。\n"
+        "打分为三者的加权和，由引擎按横截面排序取前几名。\n"
+        "⚠ 必须配「最长持有(日)」使用，建议 20（与因子的评估周期一致）。"
+        "本策略的离场条件是波动率或单日涨幅升破阈值，很少触发；不设调仓周期的话"
+        "会变成买入后长期不动——实测 7 年半只成交 4 笔，那是买入持有，不是这个策略。\n"
+        "实测（2019-2026 逐年）：胜率从动量策略的 26% 提升到 48%、回撤从 -46% 降到 -28%，"
+        "但跑赢基准的年份数仍是 4/8，与动量策略持平——风险改善可确认，收益优势不可确认。"
+    )
+    defaults = {
+        "index_ma": 200,        # 大盘择时，0=关闭
+        "max_vol": 0.60,        # 年化波动率上限
+        "max_lottery": 9.0,     # 近20日最大单日涨幅上限(%)
+        "w_vol": 1.0,           # 打分权重：低波动
+        "w_lottery": 1.0,       # 打分权重：低彩票性
+        "w_reversal": 1.0,      # 打分权重：短期反转
+        "exit_vol": 0.90,       # 波动率升破此值离场
+        "exit_lottery": 15.0,   # 出现如此大的单日涨幅即离场(%)
+    }
+    param_meta = {
+        "index_ma": {"label": "大盘择时均线", "min": 0, "max": 400, "step": 10,
+                     "hint": "沪深300 站上该均线才开新仓。0=关闭"},
+        "max_vol": {"label": "波动率上限", "min": 0.1, "max": 3, "step": 0.05},
+        "max_lottery": {"label": "最大单日涨幅上限%", "min": 2, "max": 25, "step": 0.5,
+                        "hint": "近20日内出现过更大单日涨幅的不买（彩票效应）"},
+        "w_vol": {"label": "权重·低波动", "min": 0, "max": 3, "step": 0.1},
+        "w_lottery": {"label": "权重·低彩票", "min": 0, "max": 3, "step": 0.1},
+        "w_reversal": {"label": "权重·短期反转", "min": 0, "max": 3, "step": 0.1},
+        "exit_vol": {"label": "离场波动率", "min": 0.1, "max": 5, "step": 0.05},
+        "exit_lottery": {"label": "离场单日涨幅%", "min": 5, "max": 30, "step": 1},
+    }
+
+    # 打分要跨股票可比，但 prepare 只看得到单只股票，做不了横截面标准化。
+    # 好在这三个量本身就是可比的（波动率、百分比涨幅），除以各自的典型量级即可。
+    SCALE_VOL, SCALE_LOT, SCALE_REV = 0.40, 6.0, 0.15
+
+    def warmup_bars(self) -> int:
+        return 160
+
+    def market_regime(self, dates):
+        n = int(self.params["index_ma"])
+        return index_above_ma(dates, "IDX000300", n) if n > 0 else None
+
+    def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = super().prepare(df)
+        # 近 20 日最大单日涨幅：彩票效应代理
+        df["max_ret20"] = df["pct_chg"].rolling(20, min_periods=20).max()
+        return df
+
+    def entry(self, df: pd.DataFrame) -> pd.Series:
+        p = self.params
+        return safe((df["vol20"] <= float(p["max_vol"]))
+                    & (df["max_ret20"] <= float(p["max_lottery"]))
+                    & df["ma60"].notna())
+
+    def exit(self, df: pd.DataFrame) -> pd.Series:
+        p = self.params
+        return safe((df["vol20"] > float(p["exit_vol"]))
+                    | (df["max_ret20"] > float(p["exit_lottery"])))
+
+    def score(self, df: pd.DataFrame) -> pd.Series:
+        p = self.params
+        s = (-float(p["w_vol"]) * df["vol20"] / self.SCALE_VOL
+             - float(p["w_lottery"]) * df["max_ret20"] / self.SCALE_LOT
+             - float(p["w_reversal"]) * df["mom20"] / self.SCALE_REV)
+        return s.fillna(-9.9)
+
+    def reason(self, row: pd.Series, action: str) -> str:
+        if action == "BUY":
+            return (f"年化波动 {row['vol20']:.0%}，近20日最大单日涨幅 "
+                    f"{row['max_ret20']:.1f}%，20日涨幅 {row['mom20']:+.1%}")
+        return (f"波动升至 {row['vol20']:.0%} 或出现 "
+                f"{row['max_ret20']:.1f}% 的单日大涨")
+
+
+@register
 class TurtleBreakout(Strategy):
     name = "turtle_breakout"
     label = "唐奇安通道突破"
