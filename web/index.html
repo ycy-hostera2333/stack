@@ -1,0 +1,869 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stack · A股选股与信号系统</title>
+<style>
+:root{
+  --bg:#0d1117; --panel:#161b22; --panel2:#1c232c; --line:#242c38;
+  --line2:#2f3947;
+  --fg:#e6edf3; --dim:#8b98a8; --dim2:#6b7887;
+  --accent:#4c9aff; --accent2:#7db4ff;
+  --up:#f0534f; --down:#25a55f; --warn:#e3a008;
+  --shadow:0 1px 3px rgba(0,0,0,.35);
+  --radius:10px;
+}
+@media (prefers-color-scheme: light){
+  :root{ --bg:#f2f4f7; --panel:#fff; --panel2:#f5f7fa; --line:#e1e6ec; --line2:#d0d7de;
+         --fg:#1f2328; --dim:#5d6874; --dim2:#8b96a3;
+         --shadow:0 1px 3px rgba(16,24,40,.08); }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased}
+header{display:flex;align-items:center;gap:16px;padding:14px 24px;
+  background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px;display:flex;
+  align-items:center;gap:8px}
+h1 em{font-style:normal;color:var(--accent);font-weight:700}
+h1 small{font-size:12px;color:var(--dim2);font-weight:400;letter-spacing:0}
+.status{margin-left:auto;color:var(--dim);font-size:12px;text-align:right;
+  line-height:1.45}
+nav{display:flex;gap:4px;padding:0 24px;background:var(--panel);
+  border-bottom:1px solid var(--line);overflow-x:auto;scrollbar-width:none}
+nav::-webkit-scrollbar{display:none}
+nav button{background:none;border:none;color:var(--dim);padding:11px 16px;
+  cursor:pointer;font-size:14px;border-bottom:2px solid transparent;
+  white-space:nowrap;transition:color .15s}
+nav button:hover{color:var(--fg)}
+nav button.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:550}
+main{padding:22px 24px 60px;max-width:1500px;margin:0 auto}
+.page{display:none} .page.on{display:block;animation:fade .2s ease}
+@keyframes fade{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:18px;margin-bottom:16px;box-shadow:var(--shadow)}
+.card h2{font-size:12px;margin:0 0 14px;color:var(--dim);font-weight:600;
+  text-transform:uppercase;letter-spacing:.7px;display:flex;align-items:baseline;gap:10px}
+.card h2 b{color:var(--fg);font-size:14px;text-transform:none;letter-spacing:0}
+/* min(400px,100%) 而不是直接 400px：auto-fit 的 minmax 下限是硬下限，
+   视口比它窄时会把整页撑出横向滚动条。加 min() 才能在窄屏正常塌缩。 */
+.cards2{display:grid;gap:16px;
+  grid-template-columns:repeat(auto-fit,minmax(min(400px,100%),1fr))}
+.cards2 .card{margin-bottom:0;min-width:0}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
+input,select{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+  padding:6px 9px;border-radius:5px;font-size:13px;min-width:110px}
+input[type=checkbox]{min-width:auto;width:15px;height:15px;accent-color:var(--accent)}
+label.cb{flex-direction:row;align-items:center;gap:6px;padding-bottom:7px}
+button.go{background:var(--accent);color:#fff;border:none;padding:7px 18px;
+  border-radius:5px;cursor:pointer;font-size:13px;font-weight:600}
+button.go:disabled{opacity:.5;cursor:not-allowed}
+button.ghost{background:var(--panel2);color:var(--fg);border:1px solid var(--line)}
+button.mini{background:none;border:1px solid var(--line);color:var(--dim);
+  padding:2px 8px;border-radius:4px;cursor:pointer;font-size:12px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:var(--dim);font-weight:500;padding:7px 10px;
+  border-bottom:1px solid var(--line);font-size:12px;white-space:nowrap}
+td{padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--panel2)}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.code{font-family:ui-monospace,Consolas,monospace;color:var(--dim);font-size:12px}
+.up{color:var(--up)} .down{color:var(--down)} .dim{color:var(--dim)}
+.warntx{color:var(--warn);font-size:12px}
+.reason{color:var(--dim);font-size:12px;max-width:420px}
+.grid{display:grid;gap:1px;
+  grid-template-columns:repeat(auto-fit,minmax(min(148px,100%),1fr));
+  background:var(--line);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.kpi{background:var(--panel);padding:13px 15px}
+.kpi .k{color:var(--dim);font-size:11px;margin-bottom:4px;letter-spacing:.2px}
+.kpi .v{font-size:20px;font-weight:650;font-variant-numeric:tabular-nums;
+  letter-spacing:-.3px}
+.kpi .sub{font-size:11px;color:var(--dim2);margin-top:2px}
+.kgroup{font-size:11px;color:var(--dim2);text-transform:uppercase;letter-spacing:.7px;
+  margin:16px 0 8px;font-weight:600}
+.kgroup:first-child{margin-top:0}
+
+/* 月度收益热力图 */
+.heat{border-collapse:separate;border-spacing:3px;font-size:12px;width:auto}
+.heat th{padding:3px 6px;font-size:11px;color:var(--dim2);text-align:center;border:none}
+.heat td{padding:0;border:none}
+.heat .cell{width:52px;height:30px;border-radius:5px;display:flex;align-items:center;
+  justify-content:center;font-variant-numeric:tabular-nums;font-size:11.5px;
+  background:var(--panel2);color:var(--dim2)}
+.heat .yr{color:var(--dim);font-size:11px;padding-right:8px;text-align:right;
+  font-variant-numeric:tabular-nums}
+.heat .tot{font-weight:650}
+
+/* 横向条形（年度收益 / 分布） */
+.hbars{display:flex;flex-direction:column;gap:7px}
+.hbar{display:grid;grid-template-columns:64px 1fr 76px;align-items:center;gap:10px;
+  font-size:12px}
+.hbar .lb{color:var(--dim);font-variant-numeric:tabular-nums;text-align:right}
+.hbar .tr{position:relative;height:18px;background:var(--panel2);border-radius:4px;
+  overflow:hidden}
+.hbar .fill{position:absolute;top:0;bottom:0;border-radius:4px;transition:width .35s}
+.hbar .vl{font-variant-numeric:tabular-nums;text-align:right;font-weight:550}
+.hbar .zero{position:absolute;top:0;bottom:0;width:1px;background:var(--line2)}
+.scroll{overflow-x:auto}
+.tag{display:inline-block;background:var(--panel2);border:1px solid var(--line);
+  border-radius:4px;padding:1px 7px;font-size:11px;color:var(--dim);margin-right:5px}
+.note{color:var(--dim);font-size:12px;margin-top:10px;line-height:1.6}
+.warn{background:rgba(227,160,8,.1);border:1px solid rgba(227,160,8,.35);
+  color:var(--warn);padding:10px 12px;border-radius:6px;font-size:12.5px;margin-bottom:14px}
+.err{background:rgba(240,83,79,.1);border:1px solid rgba(240,83,79,.35);
+  color:var(--up);padding:10px 12px;border-radius:6px;font-size:13px}
+canvas{width:100%;height:280px;display:block}
+canvas.short{height:150px}
+.legend{display:flex;gap:16px;font-size:12px;color:var(--dim);margin-top:10px;
+  flex-wrap:wrap}
+.legend i{display:inline-block;width:11px;height:2px;vertical-align:middle;margin-right:5px}
+.legend i.box{height:9px;border-radius:2px}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid var(--line);
+  border-top-color:var(--accent);border-radius:50%;animation:s .7s linear infinite}
+@keyframes s{to{transform:rotate(360deg)}}
+.bar{height:5px;background:var(--panel2);border-radius:3px;overflow:hidden;margin-top:6px}
+.bar>div{height:100%;background:var(--accent);transition:width .3s}
+details summary{cursor:pointer;color:var(--dim);font-size:12px;padding:4px 0}
+.params{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-top:12px;
+  padding-top:12px;border-top:1px dashed var(--line)}
+.params:empty{display:none}
+.params .ptitle{font-size:11px;color:var(--dim);width:100%;margin-bottom:-4px;
+  text-transform:uppercase;letter-spacing:.5px}
+.params label{position:relative}
+.params input,.params select{min-width:96px}
+.params .reset{align-self:flex-end;margin-bottom:1px}
+</style>
+</head>
+<body>
+
+<header>
+  <h1><em>Stack</em> <small>A股选股与信号系统</small></h1>
+  <div class="status" id="status">加载中…</div>
+</header>
+
+<nav>
+  <button class="on" data-p="signals">今日信号</button>
+  <button data-p="backtest">策略回测</button>
+  <button data-p="positions">我的持仓</button>
+  <button data-p="universe">股票池</button>
+  <button data-p="data">数据管理</button>
+</nav>
+
+<main>
+
+<!-- ============================================ 信号 -->
+<section class="page on" id="p-signals">
+  <div class="warn">
+    信号基于<b>收盘价</b>产生、参考<b>次日开盘</b>执行，与回测口径一致。盘中运行时最后一根 K 线尚未走完，结果会失真。
+    这是研究工具，不构成投资建议——先在回测里验证策略在你关心的时间段上站得住，再考虑用它做决策。
+  </div>
+  <div class="card">
+    <div class="row">
+      <label>策略<select id="sg-strategy"></select></label>
+      <label>总资金<input type="number" id="sg-cash" value="200000" step="10000"></label>
+      <label>最大持仓数<input type="number" id="sg-maxpos" value="5" min="1" max="50"></label>
+      <label>候选数量<input type="number" id="sg-limit" value="15" min="1" max="100"></label>
+      <label class="cb"><input type="checkbox" id="sg-save">记录到本地</label>
+      <label class="cb" title="盘中当日K线未走完，成交量只有半天的量，会把量比压低导致量能条件全部失效"><input type="checkbox" id="sg-partial">用未收盘数据</label>
+      <button class="go" id="sg-run">生成信号</button>
+    </div>
+    <div class="params" id="sg-params"></div>
+    <div class="note" id="sg-desc"></div>
+  </div>
+  <div id="sg-out"></div>
+</section>
+
+<!-- ============================================ 回测 -->
+<section class="page" id="p-backtest">
+  <div class="card">
+    <div class="row">
+      <label>策略<select id="bt-strategy"></select></label>
+      <label>开始<input type="date" id="bt-start" value="2021-01-01"></label>
+      <label>结束<input type="date" id="bt-end"></label>
+      <label>初始资金<input type="number" id="bt-cash" value="200000" step="10000"></label>
+      <label>最大持仓<input type="number" id="bt-maxpos" value="5" min="1" max="50"></label>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <label>止损 %<input type="number" id="bt-sl" value="0" step="1" min="0"></label>
+      <label>止盈 %<input type="number" id="bt-tp" value="0" step="1" min="0"></label>
+      <label>跟踪止损 ×ATR<input type="number" id="bt-trail" value="0" step="0.5" min="0"></label>
+      <label>最长持有(日)<input type="number" id="bt-hold" value="0" min="0"></label>
+      <label>股票池上限<input type="number" id="bt-top" value="800" min="10" step="100"></label>
+      <button class="go" id="bt-run">开始回测</button>
+    </div>
+    <div class="params" id="bt-params"></div>
+    <div class="note" id="bt-desc"></div>
+  </div>
+  <div id="bt-out"></div>
+</section>
+
+<!-- ============================================ 持仓 -->
+<section class="page" id="p-positions">
+  <div class="card">
+    <h2>登记持仓</h2>
+    <div class="row">
+      <label>代码<input id="ps-code" placeholder="600519" maxlength="6"></label>
+      <label>股数<input type="number" id="ps-shares" step="100" placeholder="100"></label>
+      <label>成本价<input type="number" id="ps-cost" step="0.01" placeholder="0.00"></label>
+      <label>买入日期<input type="date" id="ps-date"></label>
+      <label>备注<input id="ps-note" placeholder="可选"></label>
+      <button class="go" id="ps-add">添加</button>
+    </div>
+    <div class="note">登记后，"今日信号"会针对这些持仓给出卖出提醒。本系统不下单，一切成交由你在券商端完成。</div>
+  </div>
+  <div id="ps-out"></div>
+</section>
+
+<!-- ============================================ 股票池 -->
+<section class="page" id="p-universe">
+  <div class="card">
+    <h2>过滤条件</h2>
+    <div class="row">
+      <label class="cb"><input type="checkbox" id="u-st" checked>剔除 ST</label>
+      <label class="cb"><input type="checkbox" id="u-bj" checked>剔除北交所</label>
+      <label class="cb"><input type="checkbox" id="u-star">剔除科创板</label>
+      <label class="cb"><input type="checkbox" id="u-cy">剔除创业板</label>
+      <label>上市满(日)<input type="number" id="u-days" value="250" min="0"></label>
+      <label>20日均额下限(万)<input type="number" id="u-amt" value="5000" min="0" step="500"></label>
+      <label>最低价<input type="number" id="u-px" value="2" step="0.5" min="0"></label>
+      <button class="go" id="u-run">应用</button>
+    </div>
+    <div class="note">
+      这些过滤在选股之前生效。剔掉 ST（退市风险 + 5% 涨跌停）、次新股（无历史可回测）、
+      低流动性股（信号再好也买不进卖不出），比在策略里打补丁干净得多。
+    </div>
+  </div>
+  <div id="u-out"></div>
+</section>
+
+<!-- ============================================ 数据 -->
+<section class="page" id="p-data">
+  <div class="card">
+    <h2>本地行情库</h2>
+    <div class="grid" id="d-cov"></div>
+    <div class="row" style="margin-top:16px">
+      <button class="go" id="d-sync">增量同步</button>
+      <button class="go ghost" id="d-sync-full">重建全部历史</button>
+      <div id="d-prog" style="flex:1;min-width:220px"></div>
+    </div>
+    <div class="note">
+      <b>增量同步</b>只补最后一个交易日之后的数据，每天收盘后跑一次即可，约 1-3 分钟。<br>
+      <b>重建全部历史</b>会重新下载所有 K 线——前复权价格会随分红送转变化，建议每月跑一次，
+      否则旧数据的复权价和新数据对不上，回测会失真。首次约 1-2 小时。
+    </div>
+  </div>
+  <div class="card">
+    <h2>历史信号留痕</h2>
+    <div class="scroll" id="d-log"></div>
+  </div>
+</section>
+
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const api = async (url, opt) => {
+  const r = await fetch(url, opt);
+  if (!r.ok) throw new Error((await r.json().catch(()=>({detail:r.statusText}))).detail);
+  return r.json();
+};
+const post = (url, body) => api(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                                      body: JSON.stringify(body)});
+const pct  = (v,d=2) => v==null ? '—' : (v*100).toFixed(d)+'%';
+const spct = (v,d=2) => v==null ? '—' : (v>=0?'+':'')+(v*100).toFixed(d)+'%';
+const cls  = v => v==null ? '' : (v>0?'up':(v<0?'down':''));
+const num  = (v,d=2) => v==null ? '—' : Number(v).toLocaleString('zh-CN',
+               {minimumFractionDigits:d, maximumFractionDigits:d});
+const esc  = s => String(s??'').replace(/[&<>"]/g, c =>
+               ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+let STRATS = [];
+
+/* ---------------------------------------------------- 导航 */
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));
+  document.querySelectorAll('.page').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on');
+  $('#p-'+b.dataset.p).classList.add('on');
+  // 切回回测页时画布刚从 display:none 变可见，尺寸可能已经变了，重画一次
+  if (b.dataset.p==='backtest') setTimeout(redrawAll, 60);
+  if (b.dataset.p==='positions') loadPositions();
+  if (b.dataset.p==='universe')  loadUniverse();
+  if (b.dataset.p==='data')      { loadStatus(); loadLog(); }
+});
+
+/* ---------------------------------------------------- 状态 */
+async function loadStatus(){
+  try {
+    const s = await api('/api/status');
+    $('#status').innerHTML =
+      `本地 ${s.codes_with_data.toLocaleString()} 只 / ${s.bars.toLocaleString()} 根 K 线` +
+      `<br>数据截至 ${s.last_date ?? '—'}`;
+    $('#d-cov').innerHTML = [
+      ['已登记股票', s.instruments.toLocaleString()],
+      ['已有行情',   `${s.codes_with_data.toLocaleString()} <span class="dim" style="font-size:12px">/ ${s.instruments.toLocaleString()}</span>`],
+      ['指数基准',   (s.indices ?? 0).toLocaleString()],
+      ['K 线总数',   s.bars.toLocaleString()],
+      ['起始日期',   s.first_date ?? '—'],
+      ['最新日期',   s.last_date ?? '—'],
+      ['上次同步',   s.daily_synced_at?.replace('T',' ') ?? '—'],
+    ].map(([k,v])=>`<div class="kpi"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+  } catch(e){ $('#status').textContent = '后端未响应'; }
+}
+
+/* ---------------------------------------------------- 策略下拉 */
+async function loadStrategies(){
+  STRATS = await api('/api/strategies');
+  const opts = STRATS.map(s=>`<option value="${s.name}">${esc(s.label)}</option>`).join('');
+  $('#sg-strategy').innerHTML = opts;
+  $('#bt-strategy').innerHTML = opts;
+  bindStrategy('sg'); bindStrategy('bt');
+}
+
+/* 参数编辑器：完全由策略自己声明的 defaults / param_meta 驱动，
+   新增策略不用改这里的任何一行。 */
+function renderParams(prefix){
+  const s = STRATS.find(x=>x.name===$('#'+prefix+'-strategy').value);
+  const box = $('#'+prefix+'-params');
+  if(!s || !Object.keys(s.defaults||{}).length){ box.innerHTML=''; return; }
+  const meta = s.param_meta || {};
+  let h = '<div class="ptitle">策略参数</div>';
+  for(const [k,v] of Object.entries(s.defaults)){
+    const m = meta[k] || {};
+    const id = `${prefix}-p-${k}`;
+    const tip = m.hint ? ` title="${esc(m.hint)}"` : '';
+    const lbl = esc(m.label || k);
+    if(m.options){
+      h += `<label${tip}>${lbl}<select id="${id}" data-pk="${esc(k)}">`
+        + m.options.map(o=>`<option value="${esc(o)}"${o===v?' selected':''}>${esc(String(o).toUpperCase())}</option>`).join('')
+        + `</select></label>`;
+    } else if (typeof v === 'string'){
+      h += `<label${tip}>${lbl}<input id="${id}" data-pk="${esc(k)}" value="${esc(v)}"></label>`;
+    } else {
+      const a = m.min!==undefined ? ` min="${m.min}"` : '';
+      const b = m.max!==undefined ? ` max="${m.max}"` : '';
+      const st = m.step!==undefined ? ` step="${m.step}"` : '';
+      h += `<label${tip}>${lbl}<input type="number" id="${id}" data-pk="${esc(k)}"`
+        + ` value="${v}"${a}${b}${st}></label>`;
+    }
+  }
+  h += `<button class="mini reset" onclick="resetParams('${prefix}')">恢复默认</button>`;
+  box.innerHTML = h;
+}
+
+window.resetParams = prefix => renderParams(prefix);
+
+function collectParams(prefix){
+  const out = {};
+  document.querySelectorAll(`#${prefix}-params [data-pk]`).forEach(el=>{
+    const k = el.dataset.pk;
+    out[k] = el.type === 'number' ? Number(el.value) : el.value;
+  });
+  return out;
+}
+
+function bindStrategy(prefix){
+  const sel = $('#'+prefix+'-strategy');
+  sel.onchange = () => {
+    const s = STRATS.find(x=>x.name===sel.value);
+    $('#'+prefix+'-desc').innerHTML = s ? esc(s.description) : '';
+    renderParams(prefix);
+  };
+  sel.onchange();
+}
+
+function universeReq(){
+  return {
+    exclude_st: $('#u-st').checked, exclude_bj: $('#u-bj').checked,
+    exclude_star: $('#u-star').checked, exclude_chinext: $('#u-cy').checked,
+    min_listed_days: +$('#u-days').value,
+    min_amount: +$('#u-amt').value * 10000,
+    min_price: +$('#u-px').value,
+  };
+}
+
+/* ---------------------------------------------------- 信号 */
+$('#sg-run').onclick = async () => {
+  const btn = $('#sg-run'); btn.disabled = true;
+  $('#sg-out').innerHTML = '<div class="card"><span class="spin"></span> 全市场扫描中…</div>';
+  try {
+    const r = await post('/api/signals', {
+      strategy: $('#sg-strategy').value,
+      portfolio_value: +$('#sg-cash').value,
+      max_positions: +$('#sg-maxpos').value,
+      max_candidates: +$('#sg-limit').value,
+      save: $('#sg-save').checked,
+      allow_partial_bar: $('#sg-partial').checked,
+      params: collectParams('sg'),
+      universe: universeReq(),
+    });
+    if (r.error) { $('#sg-out').innerHTML = `<div class="err">${esc(r.error)}</div>`; return; }
+
+    let h = '';
+    if (r.regime_note)
+      h += `<div class="warn">${esc(r.regime_note)}</div>`;
+    if (r.skipped_partial_bar)
+      h += `<div class="warn">今日尚未收盘，当日 K 线不完整——成交量只有半天的量，
+        会把量比压低到几乎所有量能条件都不成立。已自动改用上一个已收盘交易日
+        <b>${r.as_of}</b> 的数据。</div>`;
+    h += `<div class="card"><h2>扫描结果</h2>
+      <span class="tag">截至 ${r.as_of}</span>
+      <span class="tag">${esc(r.strategy_label)}</span>
+      <span class="tag">股票池 ${r.universe_size} 只</span>
+      ${r.saved ? `<span class="tag">已记录 ${r.saved} 条</span>` : ''}</div>`;
+
+    if (r.sells.length) {
+      h += `<div class="card"><h2>卖出提醒 · ${r.sells.length}</h2><div class="scroll"><table>
+        <thead><tr><th>代码</th><th>名称</th><th class="num">收盘价</th><th>理由</th></tr></thead><tbody>`
+        + r.sells.map(s=>`<tr><td class="code">${s.code}</td><td>${esc(s.name)}</td>
+          <td class="num">${num(s.price)}</td><td class="reason">${esc(s.reason)}</td></tr>`).join('')
+        + `</tbody></table></div></div>`;
+    }
+
+    h += `<div class="card"><h2>买入候选 · ${r.buys.length}</h2>`;
+    if (!r.buys.length) h += '<div class="dim">今日没有符合条件的买入信号。</div>';
+    else h += `<div class="scroll"><table>
+      <thead><tr><th>#</th><th>代码</th><th>名称</th><th class="num">收盘价</th>
+      <th class="num">RSI</th><th class="num">量比</th><th class="num">建议股数</th>
+      <th class="num">约需资金</th><th>理由</th><th></th></tr></thead><tbody>`
+      + r.buys.map((b,i)=>`<tr><td class="dim">${i+1}</td><td class="code">${b.code}</td>
+        <td>${esc(b.name)}</td><td class="num">${num(b.price)}</td>
+        <td class="num">${num(b.rsi14,0)}</td><td class="num">${num(b.vol_ratio,1)}</td>
+        <td class="num">${b.affordable===false
+          ? '<span class="warntx">买不起一手</span>' : b.suggest_shares.toLocaleString()}</td>
+        <td class="num">${b.affordable===false
+          ? `<span class="warntx">需 ${num(b.min_amount,0)}</span>` : num(b.suggest_amount,0)}</td>
+        <td class="reason">${esc(b.reason)}${b.note
+          ? `<br><span class="warntx">${esc(b.note)}</span>` : ''}</td>
+        <td>${b.affordable===false ? '' :
+          `<button class="mini" onclick="quickAdd(this,'${b.code}','${esc(b.name)}',
+            ${b.suggest_shares},${b.price})">记为持仓</button>`}</td></tr>`).join('')
+      + `</tbody></table></div>`;
+    h += `<div class="note">${esc(r.note)}</div></div>`;
+    $('#sg-out').innerHTML = h;
+  } catch(e){ $('#sg-out').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+  finally { btn.disabled = false; }
+};
+
+/* ---------------------------------------------------- 回测 */
+$('#bt-run').onclick = async () => {
+  const btn = $('#bt-run'); btn.disabled = true;
+  $('#bt-out').innerHTML = '<div class="card"><span class="spin"></span> 回测中，全市场可能需要一两分钟…</div>';
+  try {
+    const r = await post('/api/backtest', {
+      strategy: $('#bt-strategy').value,
+      start: $('#bt-start').value, end: $('#bt-end').value,
+      initial_cash: +$('#bt-cash').value,
+      max_positions: +$('#bt-maxpos').value,
+      stop_loss: +$('#bt-sl').value/100, take_profit: +$('#bt-tp').value/100,
+      trail_stop_atr: +$('#bt-trail').value, max_hold_days: +$('#bt-hold').value,
+      top: +$('#bt-top').value, params: collectParams('bt'),
+      universe: universeReq(),
+    });
+    const m = r.metrics;
+    if (m.error) { $('#bt-out').innerHTML = `<div class="err">${esc(m.error)}</div>`; return; }
+
+    const a = r.analytics || {};
+    const kpi = (k,v,c,sub) => `<div class="kpi"><div class="k">${k}</div>
+      <div class="v ${c||''}">${v}</div>${sub?`<div class="sub">${sub}</div>`:''}</div>`;
+
+    let h = `<div class="card">
+      <h2>绩效总览 <b>${esc(r.strategy)}</b>
+        <span class="dim" style="font-weight:400;text-transform:none;letter-spacing:0">
+        ${r.start} ~ ${r.end} · 股票池 ${r.universe_size} 只</span></h2>
+
+      <div class="kgroup">收益</div>
+      <div class="grid">
+        ${kpi('总收益', spct(m.total_return), cls(m.total_return))}
+        ${kpi('年化收益', spct(m.cagr), cls(m.cagr))}
+        ${kpi('期末净值', num(m.final_equity,0), cls(m.total_return),
+              `初始 ${num(r.config.initial_cash,0)}`)}
+        ${kpi('沪深300', spct(m.benchmark_return), cls(m.benchmark_return))}
+        ${kpi('超额收益', spct(m.excess_return), cls(m.excess_return))}
+      </div>
+
+      <div class="kgroup">风险</div>
+      <div class="grid">
+        ${kpi('最大回撤', pct(m.max_drawdown), 'down',
+              `基准 ${pct(m.benchmark_max_drawdown)}`)}
+        ${kpi('水下最长', (m.max_drawdown_days??0)+' 日', '',
+              `约 ${((m.max_drawdown_days??0)/21).toFixed(1)} 个月`)}
+        ${kpi('年化波动', pct(m.volatility))}
+        ${kpi('夏普', num(m.sharpe), cls(m.sharpe))}
+        ${kpi('索提诺', num(m.sortino), cls(m.sortino))}
+        ${kpi('卡玛', num(m.calmar), cls(m.calmar), '年化 ÷ 回撤')}
+      </div>
+
+      <div class="kgroup">交易</div>
+      <div class="grid">
+        ${kpi('交易笔数', m.trades ?? 0, '', `${(m.trades/Math.max((m.days??1)/21,1)).toFixed(1)} 笔/月`)}
+        ${kpi('胜率', pct(m.win_rate,1))}
+        ${kpi('盈亏比', m.profit_factor==null?'—':num(m.profit_factor),
+              cls((m.profit_factor??1)-1))}
+        ${kpi('平均持有', (m.avg_hold_days??'—')+' 日')}
+        ${kpi('平均每笔', spct(m.avg_return), cls(m.avg_return),
+              `盈 ${spct(m.avg_win,1)} / 亏 ${spct(m.avg_loss,1)}`)}
+        ${kpi('最好 / 最差', `${spct(m.best_trade,0)}`, cls(m.best_trade),
+              `最差 ${spct(m.worst_trade,0)}`)}
+      </div>`;
+    if (m.note) h += `<div class="note">${esc(m.note)}</div>`;
+    if (r.skipped && Object.keys(r.skipped).length)
+      h += `<div class="note">受 A 股规则限制未能成交：` +
+           Object.entries(r.skipped).map(([k,v])=>`${k} ${v} 次`).join('，') + `</div>`;
+    h += `</div>`;
+
+    h += `<div class="card"><h2>净值曲线</h2><canvas id="eq"></canvas>
+      <div class="legend"><span><i style="background:var(--accent)"></i>策略</span>
+      <span><i style="background:var(--dim)"></i>沪深300</span></div></div>`;
+
+    if (a.drawdown?.length)
+      h += `<div class="card"><h2>回撤曲线 <b>最深 ${pct(m.max_drawdown)}</b></h2>
+        <canvas id="dd" class="short"></canvas>
+        <div class="note">水下时间比回撤深度更折磨人——这条线离 0 有多久，
+        就是你要忍受账户不创新高多久。本次最长 ${m.max_drawdown_days} 个交易日。</div></div>`;
+
+    if (a.exposure?.length)
+      h += `<div class="card"><h2>仓位暴露 <b>平均 ${pct(
+              a.exposure.reduce((x,y)=>x+y,0)/a.exposure.length, 0)}</b></h2>
+        <canvas id="expo" class="short"></canvas>
+        <div class="note">持仓市值占总资产的比例。带大盘择时的策略会出现整段空仓，
+        这正是它规避下跌的方式。</div></div>`;
+
+    const cells = [];
+    if (a.monthly && Object.keys(a.monthly).length)
+      cells.push(`<div class="card"><h2>月度收益 %</h2>${heatmap(a.monthly)}</div>`);
+    if (a.yearly?.length){
+      const items = [];
+      a.yearly.forEach(y=>{
+        items.push({label:y.year, value:y.ret});
+        if(y.bench!=null) items.push({label:'　└基准', value:y.bench});
+      });
+      cells.push(`<div class="card"><h2>年度收益 vs 沪深300</h2>${hbars(items)}</div>`);
+    }
+    if (cells.length) h += `<div class="cards2">${cells.join('')}</div>`;
+
+    if (a.trade_dist?.some(d=>d.count)){
+      const mxc = Math.max(...a.trade_dist.map(d=>d.count));
+      h += `<div class="card"><h2>单笔收益分布 <b>共 ${m.trades} 笔</b></h2>`
+        + hbars(a.trade_dist.map(d=>({label:d.label, value:d.count})), {
+            signed:false, plain:true, fmt:v=>v||'',
+            color:'var(--accent)'})
+        + `<div class="note">A 股收益极度右偏：少数大赢家贡献全部收益。
+           如果右尾（>30%）几乎是空的，说明止盈太早，砍掉了收益来源。</div></div>`;
+    }
+
+    const T = r.trades || [];
+    if (T.length){
+      const recent = T.slice().reverse().slice(0,80);
+      h += `<div class="card"><h2>成交明细 <b>最近 ${recent.length} / 共 ${T.length} 笔</b></h2>
+        <div class="scroll"><table><thead><tr>
+        <th>代码</th><th>名称</th><th>买入</th><th>卖出</th><th class="num">持有</th>
+        <th class="num">买价</th><th class="num">卖价</th><th class="num">盈亏</th>
+        <th class="num">收益率</th><th>卖出原因</th></tr></thead><tbody>`
+        + recent.map(t=>`<tr><td class="code">${t.code}</td><td>${esc(t.name)}</td>
+          <td class="dim">${t.open_date}</td><td class="dim">${t.close_date}</td>
+          <td class="num">${t.hold_days}日</td>
+          <td class="num">${num(t.open_price)}</td><td class="num">${num(t.close_price)}</td>
+          <td class="num ${cls(t.pnl)}">${num(t.pnl,0)}</td>
+          <td class="num ${cls(t.pnl_pct)}">${spct(t.pnl_pct)}</td>
+          <td class="reason">${esc(t.close_reason)}</td></tr>`).join('')
+        + `</tbody></table></div></div>`;
+    }
+    $('#bt-out').innerHTML = h;
+
+    clearCharts();
+    const D = r.equity.dates;
+    chart('#eq', {dates:D, fmtY:v=>(v/10000).toFixed(1)+'万', series:[
+      {data:r.equity.benchmark, color:css('--dim'), width:1.2},
+      {data:r.equity.value, color:css('--accent'), width:1.8},
+    ]});
+    if(a.drawdown?.length) chart('#dd', {dates:D, zeroBase:true, padL:52,
+      fmtY:v=>(v*100).toFixed(0)+'%', series:[
+        {data:a.drawdown, color:css('--up'), width:1.2, fill:'rgba(240,83,79,.16)'}]});
+    if(a.exposure?.length) chart('#expo', {dates:D, zeroBase:true, padL:52,
+      fmtY:v=>(v*100).toFixed(0)+'%', series:[
+        {data:a.exposure, color:css('--accent'), width:1, fill:'rgba(76,154,255,.18)'}]});
+  } catch(e){ $('#bt-out').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+  finally { btn.disabled = false; }
+};
+
+/* ------- 通用折线/面积图，纯 canvas，不依赖任何外部图表库 ------- */
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function drawChart(sel, opt){
+  const cv = document.querySelector(sel); if(!cv) return;
+  const dates = opt.dates || [];
+  const series = (opt.series || []).filter(s => s.data && s.data.length);
+  if(!dates.length || !series.length) return;
+
+  const dpr = devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if(!W || !H) return;
+  cv.width = W*dpr; cv.height = H*dpr;
+  const g = cv.getContext('2d'); g.scale(dpr,dpr);
+  g.clearRect(0,0,W,H);
+
+  const pad = {l: opt.padL ?? 60, r:14, t:10, b:24};
+  let lo = Infinity, hi = -Infinity;
+  series.forEach(s => s.data.forEach(v => {
+    if(v!=null && isFinite(v)){ lo=Math.min(lo,v); hi=Math.max(hi,v); } }));
+  if(!isFinite(lo)) return;
+  if(opt.zeroBase){ hi = Math.max(hi,0); lo = Math.min(lo,0); }
+  const span = (hi-lo)||1; lo -= span*.06; hi += span*.06;
+
+  const X = i => pad.l + i*(W-pad.l-pad.r)/Math.max(dates.length-1,1);
+  const Y = v => pad.t + (hi-v)/(hi-lo)*(H-pad.t-pad.b);
+
+  // 网格 + 刻度
+  g.strokeStyle = css('--line'); g.fillStyle = css('--dim2'); g.lineWidth = 1;
+  g.font = '10.5px ui-monospace,Consolas,monospace';
+  for(let i=0;i<=4;i++){
+    const v = lo+(hi-lo)*i/4, y = Y(v);
+    g.beginPath(); g.moveTo(pad.l,y); g.lineTo(W-pad.r,y); g.stroke();
+    g.textAlign='right';
+    g.fillText(opt.fmtY ? opt.fmtY(v) : v.toFixed(1), pad.l-7, y+3.5);
+  }
+  g.textAlign='center';
+  const ticks = Math.min(5, dates.length);
+  for(let k=0;k<ticks;k++){
+    const i = Math.round(k*(dates.length-1)/Math.max(ticks-1,1));
+    if(dates[i]) g.fillText(dates[i].slice(0,7), X(i), H-7);
+  }
+
+  series.forEach(s => {
+    if(s.fill){
+      g.beginPath(); let started=false;
+      s.data.forEach((v,i)=>{ if(v==null) return;
+        started ? g.lineTo(X(i),Y(v)) : (g.moveTo(X(i),Y(v)), started=true); });
+      const base = Y(opt.zeroBase ? 0 : lo);
+      g.lineTo(X(s.data.length-1), base); g.lineTo(X(0), base); g.closePath();
+      g.fillStyle = s.fill; g.fill();
+    }
+    g.strokeStyle = s.color; g.lineWidth = s.width || 1.6;
+    if(s.dash) g.setLineDash(s.dash); else g.setLineDash([]);
+    g.beginPath(); let st=false;
+    s.data.forEach((v,i)=>{ if(v==null) return;
+      st ? g.lineTo(X(i),Y(v)) : (g.moveTo(X(i),Y(v)), st=true); });
+    g.stroke(); g.setLineDash([]);
+  });
+}
+
+/* 图表尺寸自适应。
+
+   用 ResizeObserver 直接观察 canvas 本身，而不是监听 window 的 resize 事件：
+   canvas 的像素尺寸必须跟着 CSS 尺寸走，否则画面会被拉伸变形。触发 canvas 变形的
+   不只有窗口缩放——切换标签页、容器宽度变化、字体加载完成都会改变布局，
+   而这些都不会触发 window.resize。 */
+window._charts = new Map();
+
+function redrawAll(){
+  window._charts.forEach((rec, el) => { if(el.clientWidth) drawChart(rec.sel, rec.opt); });
+}
+
+const _ro = new ResizeObserver(entries => {
+  for(const e of entries){
+    const rec = window._charts.get(e.target);
+    if(rec && e.target.clientWidth) drawChart(rec.sel, rec.opt);
+  }
+});
+
+// 三重保险。画布的像素尺寸和 CSS 尺寸一旦不一致，图就会被拉伸变形，
+// 所以这里宁可多画几次也不能漏：
+//   1) ResizeObserver —— 容器尺寸变化（侧栏展开、字体加载等）
+//   2) window.resize  —— 拖动窗口
+//   3) 尺寸轮询       —— 兜底。实测确实存在两种事件都不触发的环境
+//      （视口从 424 变到 768、画布从 290 变到 667，resize 和 RO 均未触发），
+//      而轮询只是每 800ms 读几个 clientWidth，开销可以忽略。
+let _rz;
+addEventListener('resize', () => { clearTimeout(_rz); _rz = setTimeout(redrawAll, 120); });
+
+setInterval(() => {
+  window._charts.forEach((rec, el) => {
+    const w = el.clientWidth;
+    if(w && w !== rec.lastW){ rec.lastW = w; drawChart(rec.sel, rec.opt); }
+  });
+}, 800);
+
+function chart(sel, opt){
+  const el = document.querySelector(sel); if(!el) return;
+  window._charts.set(el, {sel, opt, lastW: el.clientWidth});
+  _ro.observe(el);
+  drawChart(sel, opt);
+}
+function clearCharts(){
+  window._charts.forEach((_, el) => _ro.unobserve(el));
+  window._charts.clear();
+}
+
+/* 月度收益热力图 */
+function heatmap(monthly){
+  const years = Object.keys(monthly).sort();
+  if(!years.length) return '';
+  let vals = [];
+  years.forEach(y=>Object.values(monthly[y]).forEach(v=>vals.push(v)));
+  const mx = Math.max(0.001, ...vals.map(Math.abs));
+  const cell = v => {
+    if(v==null) return `<div class="cell"></div>`;
+    const a = Math.min(1, Math.abs(v)/mx)*.82 + .10;
+    const c = v>=0 ? `rgba(240,83,79,${a})` : `rgba(37,165,95,${a})`;
+    const fg = Math.abs(v)/mx > .45 ? '#fff' : 'var(--fg)';
+    return `<div class="cell" style="background:${c};color:${fg}">${(v*100).toFixed(1)}</div>`;
+  };
+  let h = `<div class="scroll"><table class="heat"><thead><tr><th></th>`
+    + Array.from({length:12},(_,i)=>`<th>${i+1}月</th>`).join('')
+    + `<th style="padding-left:8px">全年</th></tr></thead><tbody>`;
+  years.forEach(y=>{
+    const row = monthly[y];
+    const tot = Object.values(row).reduce((a,v)=>a*(1+v),1)-1;
+    h += `<tr><td class="yr">${y}</td>`
+      + Array.from({length:12},(_,i)=>`<td>${cell(row[String(i+1)] ?? null)}</td>`).join('')
+      + `<td style="padding-left:8px"><div class="cell tot ${cls(tot)}"
+           style="background:var(--panel2)">${(tot*100).toFixed(1)}</div></td></tr>`;
+  });
+  return h + `</tbody></table></div>`;
+}
+
+/* 横向条形图：年度收益对比 / 单笔收益分布 */
+function hbars(items, opt={}){
+  const mx = Math.max(...items.map(i=>Math.abs(i.value)), 1e-9);
+  const signed = opt.signed !== false;
+  return `<div class="hbars">` + items.map(i=>{
+    const w = Math.abs(i.value)/mx*(signed?50:100);
+    const pos = i.value >= 0;
+    const color = opt.color || (pos ? 'var(--up)' : 'var(--down)');
+    const style = signed
+      ? `left:50%;width:${w}%;${pos?'':`left:${50-w}%`}`
+      : `left:0;width:${w}%`;
+    return `<div class="hbar"><div class="lb">${esc(i.label)}</div>
+      <div class="tr">${signed?'<div class="zero" style="left:50%"></div>':''}
+        <div class="fill" style="${style};background:${color}"></div></div>
+      <div class="vl ${opt.plain?'':cls(i.value)}">${opt.fmt? opt.fmt(i.value):spct(i.value,1)}</div>
+    </div>`;
+  }).join('') + `</div>`;
+}
+
+/* 信号 → 持仓 一键登记。
+   信号页给的是「参考次日开盘执行」，所以这里默认填的是信号日收盘价，
+   实际成交后你应当到持仓页把成本价改成真实成交价——否则盈亏是算不准的。 */
+window.quickAdd = async (btn, code, name, shares, price) => {
+  const n = prompt(`登记 ${code} ${name} 为持仓\n\n股数（建议 ${shares}）：`, shares);
+  if (n === null) return;
+  const p = prompt(`成本价\n\n注意：信号是次日开盘执行，这里先填信号日收盘价 ${price}，\n`
+                 + `成交后请改成你的真实成交价。`, price);
+  if (p === null) return;
+  const sh = Math.round(Number(n)), px = Number(p);
+  if (!sh || sh % 100 !== 0) return alert('股数必须是 100 的整数倍');
+  if (!(px > 0)) return alert('成本价必须大于 0');
+  btn.disabled = true; btn.textContent = '已记录';
+  try {
+    await post('/api/positions', {code, name, shares: sh, cost: px,
+      open_date: new Date().toISOString().slice(0,10), note: '来自信号'});
+  } catch(e){ btn.disabled = false; btn.textContent = '记为持仓'; alert(e.message); }
+};
+
+/* ---------------------------------------------------- 持仓 */
+async function loadPositions(){
+  try{
+    const r = await api('/api/positions');
+    if(!r.rows.length){ $('#ps-out').innerHTML='<div class="card dim">还没有登记任何持仓。</div>'; return; }
+    $('#ps-out').innerHTML = `<div class="card"><h2>持仓汇总</h2><div class="grid">` + [
+      ['总成本', num(r.total_cost,0), ''],
+      ['总市值', num(r.total_value,0), ''],
+      ['浮动盈亏', num(r.total_pnl,0), cls(r.total_pnl)],
+      ['收益率', spct(r.total_pnl_pct), cls(r.total_pnl_pct)],
+    ].map(([k,v,c])=>`<div class="kpi"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`).join('')
+    + `</div></div><div class="card"><h2>明细</h2><div class="scroll"><table><thead><tr>
+      <th>代码</th><th>名称</th><th class="num">股数</th><th class="num">成本</th>
+      <th class="num">现价</th><th class="num">市值</th><th class="num">盈亏</th>
+      <th class="num">收益率</th><th>买入日</th><th>备注</th><th></th></tr></thead><tbody>`
+    + r.rows.map(p=>`<tr><td class="code">${p.code}</td><td>${esc(p.name)}</td>
+        <td class="num">${p.shares.toLocaleString()}</td><td class="num">${num(p.cost)}</td>
+        <td class="num">${num(p.price)}${p.price_source==='cache'
+          ? '<span class="dim" title="实时价取不到，用的是本地前复权收盘价，除权后会有偏差"> ~</span>'
+          : (p.price_source==='none' ? '<span class="dim"> ?</span>' : '')}</td>
+        <td class="num">${num(p.market_value,0)}</td>
+        <td class="num ${cls(p.pnl)}">${num(p.pnl,0)}</td>
+        <td class="num ${cls(p.pnl_pct)}">${spct(p.pnl_pct)}</td>
+        <td class="dim">${p.open_date??''}</td><td class="dim">${esc(p.note??'')}</td>
+        <td><button class="mini" onclick="delPos(${p.id})">删除</button></td></tr>`).join('')
+    + `</tbody></table></div></div>`;
+  }catch(e){ $('#ps-out').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+}
+window.delPos = async id => { await api('/api/positions/'+id,{method:'DELETE'}); loadPositions(); };
+$('#ps-add').onclick = async () => {
+  const code = $('#ps-code').value.trim();
+  if(!/^\d{6}$/.test(code)) return alert('请输入 6 位股票代码');
+  const shares = +$('#ps-shares').value, cost = +$('#ps-cost').value;
+  if(!shares || !cost) return alert('请填写股数和成本价');
+  await post('/api/positions', {code, shares, cost,
+    open_date: $('#ps-date').value || new Date().toISOString().slice(0,10),
+    note: $('#ps-note').value});
+  ['#ps-code','#ps-shares','#ps-cost','#ps-note'].forEach(s=>$(s).value='');
+  loadPositions();
+};
+
+/* ---------------------------------------------------- 股票池 */
+async function loadUniverse(){
+  $('#u-out').innerHTML = '<div class="card"><span class="spin"></span> 计算中…</div>';
+  try{
+    const r = await post('/api/universe', universeReq());
+    let h = `<div class="card"><h2>共 ${r.count.toLocaleString()} 只</h2>`
+      + Object.entries(r.by_board).map(([k,v])=>`<span class="tag">${esc(k)} ${v}</span>`).join('')
+      + `</div>`;
+    if(r.rows.length) h += `<div class="card"><h2>流动性前 ${r.rows.length} 只</h2>
+      <div class="scroll"><table><thead><tr><th>代码</th><th>名称</th><th>板块</th>
+      <th>行业</th><th class="num">20日均额</th><th class="num">最新价</th></tr></thead><tbody>`
+      + r.rows.map(x=>`<tr><td class="code">${x.code}</td><td>${esc(x.name)}</td>
+        <td class="dim">${esc(x.board)}</td><td class="dim">${esc(x.industry??'—')}</td>
+        <td class="num">${num(x.avg_amount/1e8,2)} 亿</td>
+        <td class="num">${num(x.last_close)}</td></tr>`).join('')
+      + `</tbody></table></div></div>`;
+    $('#u-out').innerHTML = h;
+  }catch(e){ $('#u-out').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+}
+$('#u-run').onclick = loadUniverse;
+
+/* ---------------------------------------------------- 数据同步 */
+async function startSync(full){
+  await post(`/api/sync?full=${full}`, {});
+  pollSync();
+}
+$('#d-sync').onclick = () => startSync(false);
+$('#d-sync-full').onclick = () => {
+  if(confirm('将重新下载全部历史 K 线，约需 1-2 小时。确定继续？')) startSync(true);
+};
+async function pollSync(){
+  const s = await api('/api/sync/status');
+  const p = s.total ? s.done/s.total : 0;
+  $('#d-prog').innerHTML = s.running
+    ? `<div style="font-size:12px;color:var(--dim)"><span class="spin"></span>
+       ${esc(s.phase)} ${s.total?`${s.done}/${s.total}`:''}
+       ${s.stats?.failed?`· 失败 ${s.stats.failed}`:''}</div>
+       <div class="bar"><div style="width:${(p*100).toFixed(1)}%"></div></div>`
+    : (s.finished_at ? `<div style="font-size:12px;color:var(--dim)">${esc(s.phase)} · ${s.finished_at}</div>` : '');
+  if(s.running) setTimeout(pollSync, 2000); else loadStatus();
+}
+
+async function loadLog(){
+  const rows = await api('/api/signals/history?limit=150');
+  $('#d-log').innerHTML = !rows.length ? '<div class="dim">还没有记录。生成信号时勾选"记录到本地"即可留痕。</div>'
+    : `<table><thead><tr><th>日期</th><th>策略</th><th>动作</th><th>代码</th>
+       <th>名称</th><th class="num">价格</th><th>理由</th></tr></thead><tbody>`
+    + rows.map(r=>`<tr><td class="dim">${r.date}</td><td class="dim">${esc(r.strategy)}</td>
+      <td class="${r.action==='BUY'?'up':'down'}">${r.action==='BUY'?'买入':'卖出'}</td>
+      <td class="code">${r.code}</td><td>${esc(r.name)}</td>
+      <td class="num">${num(r.price)}</td><td class="reason">${esc(r.reason)}</td></tr>`).join('')
+    + `</tbody></table>`;
+}
+
+/* ---------------------------------------------------- 启动 */
+const today = new Date().toISOString().slice(0,10);
+$('#bt-end').value = today; $('#ps-date').value = today;
+loadStatus(); loadStrategies(); pollSync();
+</script>
+</body>
+</html>

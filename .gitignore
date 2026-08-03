@@ -1,0 +1,26 @@
+# 本地行情库：1GB+ 的派生数据，跑一遍 sync 就能重建，不入版本库。
+# 必须写成 /data/ 锚定到仓库根目录——只写 data/ 会匹配任意层级，
+# 把源码目录 stack/data/ 也一起排除掉。
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# 虚拟环境
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 本地运行配置（含端口等机器相关设置）
+.claude/

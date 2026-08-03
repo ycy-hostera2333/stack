@@ -1,0 +1,14 @@
+# A股选股与信号辅助系统 —— 运行依赖
+#
+# 安装：
+#   python -m venv .venv
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# 版本为开发时实测可用的组合。akshare 是爬虫聚合库，上游接口时有变动，
+# 若某个数据接口失效，优先尝试升级 akshare。
+
+akshare>=1.18.79
+pandas>=2.2
+numpy>=1.26
+fastapi>=0.115
+uvicorn[standard]>=0.30
