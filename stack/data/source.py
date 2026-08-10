@@ -63,12 +63,12 @@ def _circuit_reset(src: str) -> None:
 # 那是错的。一次 4429 只的单源全市场同步里，失败率随时间单调恶化（前 3150 只失败
 # 20%，最后 200 只失败 92%），是**累积触发的限流**，短样本测不出来。
 #
-# 现在有了多源 fallback，压力被分摊到 4 个源上，单源承受的请求密度降低，
-# 因此并发可以回到 12——但这个前提一旦不成立（比如只剩一个源可用），
-# 限流问题会立刻回来。真出现大面积失败时，先把 MAX_WORKERS 调回 5、
-# REQUEST_GAP 调回 0.15 再说。
-MAX_WORKERS = 12
-REQUEST_GAP = 0.02       # 每个请求前的最小间隔（秒）
+# 多源 fallback 确实能分摊压力，理论上可以提高并发；但唯一一次实测有据的
+# 全市场同步是「并发 5 + 间隔 0.15s」跑出的 4589 只成功、失败 0。
+# 在没有同等规模的实测支撑之前，保守值优先——一次干净的全量同步
+# 比快一倍但要重跑三遍划算。
+MAX_WORKERS = 5
+REQUEST_GAP = 0.15       # 每个请求前的最小间隔（秒）
 RETRY = 2                # 单源重试次数——失败快速切下一个源，不在此源上死等
 SINGLE_SOURCE_RETRY = 2
 RETRY_SLEEP = 1.0        # 退避基数，实际为 RETRY_SLEEP * 2^n + 抖动
@@ -502,15 +502,14 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
     if codes is None:
         codes = inst["code"].tolist()
 
-    # only_missing：只补 sync_errors 表里记录过的失败股票（上游限流后专门补缺用）。
-    # 此时忽略传入的 codes，直接以失败记录为准。
-    if only_missing:
-        err = store.load_sync_errors(limit=100000)
-        codes = err["code"].tolist() if not err.empty else []
-        if not codes:
-            return {"requested": 0, "pending": 0, "ok": 0, "failed": 0,
-                    "rows": 0, "passes": 0, "note": "没有待补的失败记录"}
-
+    # only_missing：只补**本地完全没有数据**的股票，已有数据的一律跳过。
+    #
+    # 曾一度改成"只补 sync_errors 表里记录过的失败股票"，那是个退化：
+    # 失败记录只在同步过程中产生，新库或换机器后该表是空的，
+    # 此时 --only-missing 会什么都不做，而这恰恰是最需要它的场景。
+    # 以"本地有没有数据"为准则不依赖任何历史状态，任何时候都正确。
+    #
+    # sync_errors 仍然保留，用于界面展示哪些股票失败过、失败原因是什么。
     last = {} if full else store.last_dates()
     today = datetime.now().strftime("%Y-%m-%d")
 
@@ -524,10 +523,10 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
         if full or code not in last:
             pending.append((code, HISTORY_START))
         elif only_missing:
-            # 仅补失败：不管本地有没有数据，都往回退若干天重抓，
-            # 覆盖上次失败时可能残缺的当日/近日 K 线。
-            back = (pd.to_datetime(last[code]) - timedelta(days=overlap_days))
-            pending.append((code, back.strftime("%Y%m%d")))
+            # 本地已有数据 → 跳过。这正是 --only-missing 的意义：
+            # 补缺时重拉几千只已有的股票既慢又会再次触发限流，
+            # 实测补 1268 只缺口时能省掉 72% 的请求。
+            continue
         else:
             # 增量同步：本地已有今天的数据且上次同步在收盘后，整只跳过。
             if last[code] >= today and fresh:
