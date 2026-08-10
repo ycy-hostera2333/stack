@@ -6,6 +6,7 @@ akshare 是爬虫聚合库，接口列名会随上游改动，所以这里全部
 from __future__ import annotations
 
 import random
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -15,17 +16,80 @@ import pandas as pd
 from ..config import HISTORY_START, classify_board
 from . import store
 
-# 并发度。曾经用 24 只股票的小样本测出「12 线程最快且成功率最高」，据此设成 12——
-# 那个结论是错的。一次 4429 只的全市场同步暴露了真相：失败率随时间单调恶化，
-# 前 3150 只失败 20%，最后 200 只失败 92%。这是**累积触发的限流**，不是随机抖动，
-# 短样本根本测不出来。降并发 + 请求间隔 + 失败后长冷却才是对症的做法。
+# ------------------------------------------------------------------ 熔断器
+# 某个数据源连续失败 N 次后，临时跳过该源，直接切到下一个，
+# 避免在已经挂掉的源上死等。
+#
+# 必须有「半开」恢复：熔断后该源被跳过，跳过就不会有成功，也就永远等不到重置——
+# 没有超时恢复的话，一次瞬时失败会把这个源**永久废掉**（实测四源各失败一次后
+# fetch_daily 对所有股票直接返回空表）。所以这里记录熔断时刻，
+# 冷却期一过就放行一次试探，成功即完全恢复。
+_circuit_state: dict[str, int] = {"tencent": 0, "baostock": 0,
+                                  "tushare": 0, "akshare": 0}
+_circuit_until: dict[str, float] = {}
+_circuit_lock = threading.Lock()
+CIRCUIT_THRESHOLD = 3      # 连续失败达到此数才熔断（1 太敏感，网络抖动就会误伤）
+CIRCUIT_COOLDOWN = 60.0    # 冷却秒数，过后放行一次试探
+
+
+def _circuit_open(src: str) -> bool:
+    """该源当前是否应跳过。冷却期已过则放行试探。"""
+    with _circuit_lock:
+        if _circuit_state.get(src, 0) < CIRCUIT_THRESHOLD:
+            return False
+        if time.time() >= _circuit_until.get(src, 0.0):
+            # 半开：允许一次试探。失败会重新计时，成功则由 _circuit_reset 清零
+            _circuit_until[src] = time.time() + CIRCUIT_COOLDOWN
+            return False
+        return True
+
+
+def _circuit_fail(src: str) -> None:
+    """记录一次源失败，达到阈值则开始计时冷却。"""
+    with _circuit_lock:
+        n = _circuit_state.get(src, 0) + 1
+        _circuit_state[src] = n
+        if n >= CIRCUIT_THRESHOLD:
+            _circuit_until[src] = time.time() + CIRCUIT_COOLDOWN
+
+
+def _circuit_reset(src: str) -> None:
+    """源成功一次，完全恢复。"""
+    with _circuit_lock:
+        _circuit_state[src] = 0
+        _circuit_until.pop(src, None)
+
+# 并发度的历史教训：曾用 24 只股票的小样本测出「12 线程最快」，据此设成 12——
+# 那是错的。一次 4429 只的单源全市场同步里，失败率随时间单调恶化（前 3150 只失败
+# 20%，最后 200 只失败 92%），是**累积触发的限流**，短样本测不出来。
+#
+# 多源 fallback 确实能分摊压力，理论上可以提高并发；但唯一一次实测有据的
+# 全市场同步是「并发 5 + 间隔 0.15s」跑出的 4589 只成功、失败 0。
+# 在没有同等规模的实测支撑之前，保守值优先——一次干净的全量同步
+# 比快一倍但要重跑三遍划算。
 MAX_WORKERS = 5
-REQUEST_GAP = 0.15       # 每个请求前的最小间隔（秒），给上游降速
-RETRY = 4
-RETRY_SLEEP = 2.0        # 退避基数，实际为 RETRY_SLEEP * 2^n + 抖动
+REQUEST_GAP = 0.15       # 每个请求前的最小间隔（秒）
+RETRY = 2                # 单源重试次数——失败快速切下一个源，不在此源上死等
+SINGLE_SOURCE_RETRY = 2
+RETRY_SLEEP = 1.0        # 退避基数，实际为 RETRY_SLEEP * 2^n + 抖动
 
 # 增量同步时往回重抓的天数，用于覆盖盘中写入的残缺 K 线
 OVERLAP_DAYS = 7
+
+# BaoStock 默认关闭：它的前复权序列与腾讯/akshare **不兼容**。
+#
+# 实测（2024-01 ~ 2026-07，500 个重叠交易日）：
+#   腾讯 vs akshare —— 价格比值恒为 1.0000，日收益率最大差 3e-06（纯浮点噪声）
+#   baostock vs 腾讯 —— 比值极差 0.025~0.048，最大价格偏差 1.4%~5.1%，
+#                       日收益率差 >0.1% 的天数占 10%~23%
+#
+# 如果只是复权锚点不同，比值会是恒定常数、收益率完全一致；比值有极差
+# 说明复权算法本身不同。多源 fallback 的前提是各源可互换，baostock 不满足：
+# 同一只股票半段来自腾讯、半段来自 baostock，会在切换点产生**假的跳空**，
+# 而指标会把它当成真实的暴涨暴跌——属于"不报错但让回测失真"的那类问题。
+#
+# 想启用请自行确认复权口径一致，或只用它同步本地完全没有数据的新股票。
+USE_BAOSTOCK = False
 
 
 def _ak():
@@ -120,11 +184,9 @@ _HIST_COLS = {
 }
 
 
-def fetch_daily(code: str, start: str = HISTORY_START, end: str | None = None,
-                adjust: str = "qfq") -> pd.DataFrame:
-    """单只股票日线（默认前复权）。失败重试，最终失败返回空表而非抛出。"""
+def _fetch_akshare(code: str, start: str, end: str, adjust: str) -> pd.DataFrame:
+    """akshare 东财源：单只股票日线。失败返回空表。"""
     ak = _ak()
-    end = end or datetime.now().strftime("%Y%m%d")
     for attempt in range(RETRY):
         try:
             if REQUEST_GAP:
@@ -147,8 +209,252 @@ def fetch_daily(code: str, start: str = HISTORY_START, end: str | None = None,
         except Exception:
             if attempt == RETRY - 1:
                 return pd.DataFrame()
-            # 指数退避 + 抖动：被限流时一起重试会再次把上游打满
             time.sleep(RETRY_SLEEP * (2 ** attempt) * (0.5 + random.random()))
+    return pd.DataFrame()
+
+
+def _fetch_tencent(code: str, start: str, end: str, adjust: str = "qfq") -> pd.DataFrame:
+    """腾讯数据源：单只股票日线。
+
+    移植自 Vibe-Trading 的 tencent_loader：走 web.ifzq.gtimg.cn 接口，
+    绕开东财 CDN 的 IP 封禁。免费、无需 token、无需额外依赖（urllib 即可）。
+    返回与 akshare 相同的列结构。
+    """
+    import json
+    import urllib.request
+
+    # 腾讯接口需要带交易所前缀的代码：sh600519 / sz000001
+    qfq = "qfq" if adjust in ("qfq", "q") else ""
+    if code.startswith(("6", "9")):
+        tcode = f"sh{code}"
+    else:
+        tcode = f"sz{code}"
+
+    start_iso = pd.to_datetime(start).strftime("%Y-%m-%d")
+    end_iso = pd.to_datetime(end).strftime("%Y-%m-%d")
+    url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
+           f"param={tcode},day,{start_iso},{end_iso},500,{qfq}")
+
+    for attempt in range(RETRY):
+        try:
+            if REQUEST_GAP:
+                time.sleep(REQUEST_GAP * (0.5 + random.random()))
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36",
+                "Referer": "https://web.ifzq.gtimg.cn/",
+            })
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read().decode("utf-8")
+            data = json.loads(raw)
+            stock_data = data.get("data", {})
+            if not stock_data:
+                return pd.DataFrame()
+            stock_key = next(iter(stock_data), None)
+            if not stock_key:
+                return pd.DataFrame()
+            # 前复权时优先取 qfqday，否则取 day
+            klines = (stock_data[stock_key].get("qfqday")
+                      if adjust in ("qfq", "q")
+                      else stock_data[stock_key].get("day"))
+            if not klines:
+                return pd.DataFrame()
+            rows = []
+            for k in klines:
+                if len(k) >= 6:
+                    rows.append({
+                        "date": k[0],
+                        "open": float(k[1]),
+                        "close": float(k[2]),
+                        "high": float(k[3]),
+                        "low": float(k[4]),
+                        "volume": float(k[5]),
+                    })
+            if not rows:
+                return pd.DataFrame()
+            df = pd.DataFrame(rows)
+            df["code"] = code
+            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+            for c in ("open", "high", "low", "close", "volume"):
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            # 腾讯不返回成交额/涨跌幅/换手率，置空
+            df["amount"] = pd.NA
+            df["pct_chg"] = pd.NA
+            df["turnover"] = pd.NA
+            return df.dropna(subset=["close"])
+        except Exception:
+            if attempt == RETRY - 1:
+                return pd.DataFrame()
+            time.sleep(RETRY_SLEEP * (2 ** attempt) * (0.5 + random.random()))
+    return pd.DataFrame()
+
+
+def _fetch_baostock(code: str, start: str, end: str, adjust: str = "qfq") -> pd.DataFrame:
+    """BaoStock 数据源：单只股票日线。
+
+    移植自 Vibe-Trading 的 baostock_loader：走 TCP 协议，绕开 HTTP 数据源
+    （东财/腾讯）的 CDN 封禁。免费、无需 token。返回与 akshare 相同的列结构。
+    """
+    import baostock as bs
+
+    # baostock 需要带交易所前缀：sh.600519 / sz.000001
+    # adjustflag: 1 = 后复权, 2 = 前复权, 3 = 不复权
+    adj_flag = "1" if adjust in ("hfq", "h") else ("3" if adjust in ("", "none") else "2")
+    if code.startswith(("6", "9")):
+        bs_code = f"sh.{code}"
+    else:
+        bs_code = f"sz.{code}"
+
+    start_iso = pd.to_datetime(start).strftime("%Y-%m-%d")
+    end_iso = pd.to_datetime(end).strftime("%Y-%m-%d")
+
+    for attempt in range(RETRY):
+        try:
+            if REQUEST_GAP:
+                time.sleep(REQUEST_GAP * (0.5 + random.random()))
+            lg = bs.login()
+            if lg.error_code != "0":
+                return pd.DataFrame()
+            try:
+                rs = bs.query_history_k_data_plus(
+                    bs_code,
+                    "date,open,high,low,close,volume,amount",
+                    start_date=start_iso, end_date=end_iso,
+                    frequency="d", adjustflag=adj_flag,
+                )
+                if rs.error_code != "0":
+                    return pd.DataFrame()
+                rows = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                if not rows:
+                    return pd.DataFrame()
+                df = pd.DataFrame(rows, columns=[
+                    "date", "open", "high", "low", "close", "volume", "amount"])
+                df["code"] = code
+                df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+                for c in ("open", "high", "low", "close", "volume", "amount"):
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                df["pct_chg"] = pd.NA
+                df["turnover"] = pd.NA
+                return df.dropna(subset=["close"])
+            finally:
+                bs.logout()
+        except Exception:
+            if attempt == RETRY - 1:
+                return pd.DataFrame()
+            time.sleep(RETRY_SLEEP * (2 ** attempt) * (0.5 + random.random()))
+    return pd.DataFrame()
+
+
+def _to_tushare_code(code: str) -> str:
+    """6 位代码 → tushare 格式（600519.SH / 000001.SZ）。"""
+    code = str(code).zfill(6)
+    if code.startswith(("6", "9")):
+        return f"{code}.SH"
+    return f"{code}.SZ"
+
+
+def _fetch_tushare(code: str, start: str, end: str, adjust: str = "qfq") -> pd.DataFrame:
+    """Tushare Pro 数据源：单只股票日线（前复权）。
+
+    复用 tushare_source.fetch_daily_qfq，合并 daily + adj_factor 合成前复权。
+    需要 TUSHARE_TOKEN（环境变量或 .tushare_token 文件）。
+    返回与 akshare 相同的列结构。
+    """
+    from .tushare_source import fetch_daily_qfq, available
+    if not available():
+        return pd.DataFrame()
+    ts_code = _to_tushare_code(code)
+    start_iso = pd.to_datetime(start).strftime("%Y-%m-%d")
+    end_iso = pd.to_datetime(end).strftime("%Y-%m-%d")
+    for attempt in range(RETRY):
+        try:
+            if REQUEST_GAP:
+                time.sleep(REQUEST_GAP * (0.5 + random.random()))
+            df = fetch_daily_qfq(ts_code, start=start_iso)
+            if df is None or df.empty:
+                return pd.DataFrame()
+            # 截取到 end 日期
+            df = df[df["date"] <= end_iso]
+            if df.empty:
+                return pd.DataFrame()
+            df["code"] = code
+            for c in ("open", "high", "low", "close", "volume", "amount"):
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+            df["pct_chg"] = pd.NA
+            df["turnover"] = pd.NA
+            return df.dropna(subset=["close"])
+        except Exception:
+            if attempt == RETRY - 1:
+                return pd.DataFrame()
+            time.sleep(RETRY_SLEEP * (2 ** attempt) * (0.5 + random.random()))
+    return pd.DataFrame()
+
+
+def fetch_daily(code: str, start: str = HISTORY_START, end: str | None = None,
+                adjust: str = "qfq", on_event=None) -> pd.DataFrame:
+    """单只股票日线（默认前复权）。多源自动 fallback。
+
+    顺序：腾讯 → BaoStock → Tushare → akshare（东财）。快稳的源前置，
+    akshare 作为最后兜底（它能提供最全字段，缺点是最慢、最易限流）。
+    前一个源失败快速切下一个，全部失败才返回空表并记录 sync_errors。
+
+    熔断机制：某个源连续失败 >= CIRCUIT_THRESHOLD 次后临时跳过该源，冷却后自动恢复，
+    直接切到下一个，避免在已经挂掉的源上死等。
+
+    on_event: 可选回调 on_event(source, rows)，同步过程实时上报每只股票来自哪个源、
+    取了多少行，供看板显示实时日志。
+    """
+    end = end or datetime.now().strftime("%Y%m%d")
+    start_compact = pd.to_datetime(start).strftime("%Y%m%d")
+    end_compact = pd.to_datetime(end).strftime("%Y%m%d")
+
+    # 1) 腾讯（最快，绕开东财 CDN）
+    if not _circuit_open("tencent"):
+        df = _fetch_tencent(code, start, end, adjust)
+        if not df.empty:
+            _circuit_reset("tencent")
+            if on_event:
+                on_event("tencent", len(df))
+            return df
+        _circuit_fail("tencent")
+
+    # 2) BaoStock —— **默认不启用**，见 USE_BAOSTOCK 的说明
+    if USE_BAOSTOCK and not _circuit_open("baostock"):
+        df = _fetch_baostock(code, start, end, adjust)
+        if not df.empty:
+            _circuit_reset("baostock")
+            if on_event:
+                on_event("baostock", len(df))
+            return df
+        _circuit_fail("baostock")
+
+    # 3) Tushare Pro（需要 token，退市股专用也能兜底）
+    if not _circuit_open("tushare"):
+        df = _fetch_tushare(code, start, end, adjust)
+        if not df.empty:
+            _circuit_reset("tushare")
+            if on_event:
+                on_event("tushare", len(df))
+            return df
+        _circuit_fail("tushare")
+
+    # 4) akshare（东财，最全字段但慢）
+    if not _circuit_open("akshare"):
+        df = _fetch_akshare(code, start_compact, end_compact, adjust)
+        if not df.empty:
+            _circuit_reset("akshare")
+            if on_event:
+                on_event("akshare", len(df))
+            return df
+        _circuit_fail("akshare")
+
+    # 全部失败：记录原因
+    if on_event:
+        on_event("none", 0)
+    store.log_sync_error(code, "tencent/baostock/tushare/akshare 全部失败", attempt=RETRY)
     return pd.DataFrame()
 
 
@@ -163,7 +469,9 @@ def market_closed_today() -> bool:
 
 def sync_daily(codes: list[str] | None = None, full: bool = False,
                progress=None, overlap_days: int = OVERLAP_DAYS,
-               only_missing: bool = False) -> dict:
+               only_missing: bool = False, on_event=None,
+               circuit_breaker: int = CIRCUIT_THRESHOLD,
+               cancel_check=None) -> dict:
     """增量同步日线。
 
     增量更新不是从"本地最后日期 + 1 天"开始，而是**往回退 overlap_days 天重新抓**，
@@ -172,7 +480,19 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
     upsert 是 INSERT OR REPLACE，重叠部分会被正确的完整数据覆盖。
 
     前复权价格还会随分红送转整体变化，所以仍建议定期跑一次 full=True 重建全部历史。
+
+    circuit_breaker: 某个源连续失败 N 次后临时跳过（默认 3）。冷却 60 秒后放行试探。
+    cancel_check: 可选回调，返回 True 时中断同步。
     """
+    global CIRCUIT_THRESHOLD
+    CIRCUIT_THRESHOLD = max(1, int(circuit_breaker))
+    # 每次同步开始时清空熔断状态，包括冷却计时——否则上一轮遗留的熔断
+    # 会让这一轮一上来就跳过某些源
+    with _circuit_lock:
+        for k in _circuit_state:
+            _circuit_state[k] = 0
+        _circuit_until.clear()
+
     store.init_db()
     inst = store.load_instruments()
     if inst.empty:
@@ -182,6 +502,14 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
     if codes is None:
         codes = inst["code"].tolist()
 
+    # only_missing：只补**本地完全没有数据**的股票，已有数据的一律跳过。
+    #
+    # 曾一度改成"只补 sync_errors 表里记录过的失败股票"，那是个退化：
+    # 失败记录只在同步过程中产生，新库或换机器后该表是空的，
+    # 此时 --only-missing 会什么都不做，而这恰恰是最需要它的场景。
+    # 以"本地有没有数据"为准则不依赖任何历史状态，任何时候都正确。
+    #
+    # sync_errors 仍然保留，用于界面展示哪些股票失败过、失败原因是什么。
     last = {} if full else store.last_dates()
     today = datetime.now().strftime("%Y-%m-%d")
 
@@ -194,10 +522,14 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
     for code in codes:
         if full or code not in last:
             pending.append((code, HISTORY_START))
+        elif only_missing:
+            # 本地已有数据 → 跳过。这正是 --only-missing 的意义：
+            # 补缺时重拉几千只已有的股票既慢又会再次触发限流，
+            # 实测补 1268 只缺口时能省掉 72% 的请求。
+            continue
         else:
-            # only_missing：只补从没取到过的股票，已有数据的一律跳过。
-            # 用于上游限流后专门补缺——此时重拉几千只已有的股票既慢又会再次触发限流。
-            if only_missing or (last[code] >= today and fresh):
+            # 增量同步：本地已有今天的数据且上次同步在收盘后，整只跳过。
+            if last[code] >= today and fresh:
                 continue
             # 往回退若干天重抓，覆盖可能残缺的当日/近日 K 线
             back = (pd.to_datetime(last[code]) - timedelta(days=overlap_days))
@@ -217,7 +549,12 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
         failed: list[tuple[str, str]] = []
         starts = dict(batch)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(fetch_daily, c, s): c for c, s in batch}
+            def _wrap(code, start):
+                def _cb(src, rows):
+                    if on_event:
+                        on_event(code, src, rows)
+                return fetch_daily(code, start=start, on_event=_cb)
+            futures = {pool.submit(_wrap, c, s): c for c, s in batch}
             for fut in as_completed(futures):
                 code = futures[fut]
                 done += 1
@@ -230,6 +567,7 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
                 else:
                     stats["rows"] += store.upsert_daily(df)
                     stats["ok"] += 1
+                    store.clear_sync_errors([code])   # 补上了就清掉失败记录
                 if progress and done % 50 == 0:
                     # failed 只能按"已尝试 - 已成功"算，不能用 total - ok，
                     # 否则会把还没轮到的股票也算成失败
@@ -244,6 +582,12 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
             [(MAX_WORKERS, 0), (3, 60), (2, 120)], start=1):
         if not remaining:
             break
+        # 检查取消信号
+        if cancel_check and cancel_check():
+            stats["failed"] = len(remaining)
+            stats["failed_codes"] = [c for c, _ in remaining]
+            stats["cancelled"] = True
+            return stats
         if cooldown:
             if progress:
                 stats["failed"] = len(remaining)

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime
 from functools import partial
 
@@ -91,6 +92,11 @@ class PositionReq(BaseModel):
     note: str = ""
 
 
+class SimulatorSaveReq(BaseModel):
+    user_name: str = Field(min_length=1, max_length=40)
+    state: dict
+
+
 # ------------------------------------------------------------------ 基础信息
 @app.get("/api/status")
 async def status():
@@ -120,6 +126,51 @@ async def get_universe(req: UniverseReq):
         "by_board": uni["board"].value_counts().to_dict(),
         "rows": show.to_dict("records"),
     })
+
+
+# ------------------------------------------------------------------ 历史行情回放
+@app.get("/api/replay/instruments")
+async def replay_instruments(q: str = "", limit: int = 80):
+    """供模拟器选择股票；仅返回本地确实已有日线的标的。"""
+    out = await _run(store.instruments_with_data, q, max(1, min(limit, 200)))
+    return _clean(out.head(max(1, min(limit, 200))).to_dict("records"))
+
+
+@app.get("/api/replay/bars")
+async def replay_bars(code: str, start: str | None = None, end: str | None = None):
+    code = str(code).strip().zfill(6)
+    bars = await _run(store.load_daily, [code], start, end)
+    if bars.empty:
+        raise HTTPException(404, "该股票在所选时段没有本地日线数据")
+    inst = await _run(store.load_instruments)
+    hit = inst[inst["code"].astype(str) == code] if not inst.empty else pd.DataFrame()
+    name = str(hit["name"].iloc[0]) if not hit.empty else code
+    cols = ["date", "open", "high", "low", "close", "volume"]
+    bars["date"] = bars["date"].dt.strftime("%Y-%m-%d")
+    return _clean({"code": code, "name": name, "bars": bars[cols].to_dict("records")})
+
+
+@app.get("/api/replay/saves")
+async def replay_saves():
+    return await _run(store.list_simulator_saves)
+
+
+@app.post("/api/replay/saves")
+async def save_replay(req: SimulatorSaveReq):
+    name = req.user_name.strip()
+    if not name:
+        raise HTTPException(400, "请输入存档用户名")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    await _run(store.save_simulator, name, json.dumps(_clean(req.state), ensure_ascii=False), now)
+    return {"ok": True, "updated_at": now}
+
+
+@app.get("/api/replay/saves/{user_name}")
+async def load_replay(user_name: str):
+    saved = await _run(store.load_simulator, user_name)
+    if not saved:
+        raise HTTPException(404, "没有找到该用户的存档")
+    return {"state": json.loads(saved["payload"]), "updated_at": saved["updated_at"]}
 
 
 # ------------------------------------------------------------------ 回测
@@ -242,13 +293,26 @@ async def remove_position(pos_id: int):
 
 
 # ------------------------------------------------------------------ 数据同步
+# 线程安全内存日志：环形缓冲，同步过程实时记录每只股票来自哪个源、取了多少行。
+import collections
 _sync_state: dict = {"running": False, "phase": "", "done": 0,
-                     "total": 0, "stats": {}, "finished_at": None}
+                     "total": 0, "stats": {}, "finished_at": None,
+                     "updated_at": None, "cancelled": False,
+                     "circuit_breaker": 3}
+_sync_log: collections.deque = collections.deque(maxlen=2000)
+source_stats: dict = {"tencent": 0, "baostock": 0, "tushare": 0, "akshare": 0, "none": 0}
 
 
-def _do_sync(full: bool, limit: int | None) -> None:
+def _do_sync(full: bool, limit: int | None, only_missing: bool = False,
+             circuit_breaker: int = 3) -> None:
+    _sync_log.clear()
+    for k in source_stats:
+        source_stats[k] = 0
+    _sync_state["cancelled"] = False
+    _sync_state["circuit_breaker"] = circuit_breaker
     try:
-        _sync_state.update(running=True, phase="股票列表", done=0, total=0, finished_at=None)
+        _sync_state.update(running=True, phase="股票列表", done=0, total=0,
+                           finished_at=None, updated_at=datetime.now().strftime("%H:%M:%S"))
         source.sync_instruments()
         _sync_state["phase"] = "指数基准"
         for symbol in source.BENCHMARKS:
@@ -262,29 +326,83 @@ def _do_sync(full: bool, limit: int | None) -> None:
                      else store.load_instruments()["code"].head(limit).tolist())
 
         def prog(done, total, stats):
-            _sync_state.update(done=done, total=total, stats=dict(stats))
+            _sync_state.update(done=done, total=total, stats=dict(stats),
+                               updated_at=datetime.now().strftime("%H:%M:%S"))
 
-        stats = source.sync_daily(codes=codes, full=full, progress=prog)
-        _sync_state.update(stats=stats, done=stats["pending"], total=stats["pending"])
-        _sync_state["phase"] = "完成"
+        def _on_event(code, src, rows):
+            # 记录日志 + 累加来源统计
+            _sync_log.append({
+                "t": datetime.now().strftime("%H:%M:%S"),
+                "code": code,
+                "src": src,
+                "rows": rows,
+            })
+            if src in source_stats:
+                source_stats[src] += 1
+
+        def _cancel_check():
+            return _sync_state.get("cancelled", False)
+
+        stats = source.sync_daily(codes=codes, full=full, progress=prog,
+                                  only_missing=only_missing, on_event=_on_event,
+                                  circuit_breaker=circuit_breaker,
+                                  cancel_check=_cancel_check)
+        _sync_state.update(stats=stats, done=stats["pending"], total=stats["pending"],
+                           updated_at=datetime.now().strftime("%H:%M:%S"))
+        _sync_state["source_stats"] = dict(source_stats)
+        if _sync_state["cancelled"]:
+            _sync_state["phase"] = "已取消"
+        elif stats.get("failed"):
+            _sync_state["phase"] = f"完成，{stats['failed']} 只失败"
+        else:
+            _sync_state["phase"] = "完成"
     except Exception as e:
         _sync_state["phase"] = f"失败：{e}"
     finally:
         _sync_state["running"] = False
+        _sync_state["source_stats"] = dict(source_stats)
         _sync_state["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 @app.post("/api/sync")
-async def start_sync(full: bool = False, limit: int | None = None):
+async def start_sync(full: bool = False, limit: int | None = None,
+                     only_missing: bool = False, circuit_breaker: int = 3):
     if _sync_state["running"]:
         return {"started": False, "message": "同步已在进行中"}
-    asyncio.get_running_loop().run_in_executor(None, _do_sync, full, limit)
+    asyncio.get_running_loop().run_in_executor(
+        None, _do_sync, full, limit, only_missing, circuit_breaker)
     return {"started": True}
+
+
+@app.post("/api/sync/cancel")
+async def cancel_sync():
+    """请求中断当前同步。同步线程会在下一个检查点停止。"""
+    _sync_state["cancelled"] = True
+    return {"ok": True, "message": "取消信号已发送，同步将在近期停止"}
 
 
 @app.get("/api/sync/status")
 async def sync_status():
     return _sync_state
+
+
+@app.get("/api/sync/errors")
+async def sync_errors(limit: int = 200):
+    """最近一次同步失败的具体股票与原因。"""
+    df = await _run(store.load_sync_errors, max(1, min(limit, 1000)))
+    return _clean(df.to_dict("records") if not df.empty else [])
+
+
+@app.get("/api/sync/log")
+async def sync_log():
+    """实时同步日志流（每只股票来自哪个源、取了多少行）+ 各源统计。"""
+    return {"log": list(_sync_log), "source_stats": dict(source_stats)}
+
+
+@app.get("/api/data/gaps")
+async def data_gaps():
+    """数据缺失检查：找滞后股票和没有日线的股票。"""
+    return await _run(store.find_gaps)
 
 
 # ------------------------------------------------------------------ 前端

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -68,6 +69,21 @@ CREATE TABLE IF NOT EXISTS signal_log (
     price    REAL,
     reason   TEXT,
     PRIMARY KEY (date, strategy, code, action)
+);
+
+CREATE TABLE IF NOT EXISTS simulator_saves (
+    user_name  TEXT PRIMARY KEY,
+    payload    TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sync_errors (
+    code      TEXT NOT NULL,
+    date      TEXT NOT NULL,
+    reason    TEXT,
+    attempt   INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (code, date)
 );
 """
 
@@ -179,6 +195,44 @@ def get_meta(key: str, default: str | None = None) -> str | None:
 def load_instruments() -> pd.DataFrame:
     with connect() as conn:
         return pd.read_sql("SELECT * FROM instruments", conn)
+
+
+def instruments_with_data(query: str = "", limit: int = 80) -> pd.DataFrame:
+    """按代码或名称搜索已有日线的标的，避免把整张 daily 表读入内存。"""
+    sql = ("SELECT i.code, i.name FROM instruments i "
+           "WHERE EXISTS (SELECT 1 FROM daily d WHERE d.code=i.code)")
+    params: list = []
+    if query.strip():
+        sql += " AND (i.code LIKE ? OR i.name LIKE ?)"
+        term = f"%{query.strip()}%"
+        params.extend([term, term])
+    sql += " ORDER BY i.code LIMIT ?"
+    params.append(limit)
+    with connect() as conn:
+        return pd.read_sql(sql, conn, params=params)
+
+
+def save_simulator(user_name: str, payload: str, updated_at: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO simulator_saves (user_name,payload,updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(user_name) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at",
+            (user_name, payload, updated_at),
+        )
+
+
+def load_simulator(user_name: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("SELECT payload,updated_at FROM simulator_saves WHERE user_name=?", (user_name,)).fetchone()
+    if not row:
+        return None
+    return {"payload": row[0], "updated_at": row[1]}
+
+
+def list_simulator_saves() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute("SELECT user_name,updated_at FROM simulator_saves ORDER BY updated_at DESC").fetchall()
+    return [{"user_name": r[0], "updated_at": r[1]} for r in rows]
 
 
 def last_dates() -> dict[str, str]:
@@ -325,3 +379,123 @@ def load_signal_log(limit: int = 200) -> pd.DataFrame:
             "SELECT * FROM signal_log ORDER BY date DESC, strategy, action LIMIT ?",
             conn, params=[limit],
         )
+
+
+# ------------------------------------------------------------------ 同步失败留痕
+def log_sync_error(code: str, message: str, attempt: int = 0) -> None:
+    """记录一次同步失败。同一股票同一天重复失败时覆盖，并累加尝试次数。
+
+    date 必须是**日期**而不是精确到秒的时间戳：主键是 (code, date)，
+    用时间戳的话每次失败都是新行，ON CONFLICT 永不触发，表会无限增长。
+    """
+    now = datetime.now()
+    day = now.strftime("%Y-%m-%d")
+    ts = now.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with connect() as conn:
+            conn.execute(
+                "INSERT INTO sync_errors (code,date,reason,attempt,created_at) "
+                "VALUES (?,?,?,?,?) "
+                "ON CONFLICT(code,date) DO UPDATE SET "
+                "reason=excluded.reason, "
+                "attempt=sync_errors.attempt+1, "
+                "created_at=excluded.created_at",
+                (code, day, message, max(attempt, 1), ts),
+            )
+    except sqlite3.OperationalError:
+        # 老库还没有这张表：建好再写一次。留痕失败不应该中断同步本身。
+        init_db()
+        try:
+            with connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO sync_errors "
+                    "(code,date,reason,attempt,created_at) VALUES (?,?,?,?,?)",
+                    (code, day, message, max(attempt, 1), ts),
+                )
+        except sqlite3.Error:
+            pass
+
+
+def load_sync_errors(limit: int = 200) -> pd.DataFrame:
+    """读取最近的同步失败记录。"""
+    with connect() as conn:
+        return pd.read_sql(
+            "SELECT * FROM sync_errors ORDER BY created_at DESC, code LIMIT ?",
+            conn, params=[limit],
+        )
+
+
+def clear_sync_errors(codes: Sequence[str] | None = None) -> int:
+    """清除失败记录。codes 为 None 时清空全部；否则只清指定股票。"""
+    with connect() as conn:
+        if codes is None:
+            cur = conn.execute("DELETE FROM sync_errors")
+        else:
+            codes = list(codes)
+            if not codes:
+                return 0
+            cur = conn.execute(
+                f"DELETE FROM sync_errors WHERE code IN ({','.join('?' * len(codes))})",
+                codes,
+            )
+    return cur.rowcount
+
+
+# ------------------------------------------------------------------ 缺失检查
+def find_gaps() -> dict:
+    """数据缺失检查。
+
+    找出两类问题：
+    1. latest_lag：有数据但最新日期落后于全市场最新交易日的股票（滞后天数）
+    2. no_data：已登记但没有日线数据的股票
+
+    返回 {"market_last_date": str, "latest_lag": [...], "no_data": [...]}。
+    """
+    with connect() as conn:
+        # 全市场最新交易日（排除指数 IDX 前缀）
+        row = conn.execute(
+            "SELECT MAX(date) FROM daily WHERE code NOT LIKE 'IDX%'"
+        ).fetchone()
+        market_last = row[0] if row else None
+
+        # 每只股票的最新日期
+        lag_rows = conn.execute(
+            "SELECT code, MAX(date) AS last FROM daily "
+            "WHERE code NOT LIKE 'IDX%' GROUP BY code"
+        ).fetchall()
+
+        # 已登记但没有日线的股票
+        no_data = [r[0] for r in conn.execute(
+            "SELECT code FROM instruments WHERE code NOT LIKE 'IDX%' "
+            "AND NOT EXISTS (SELECT 1 FROM daily d WHERE d.code=instruments.code)"
+        ).fetchall()]
+
+        # 同步失败记录（从 sync_errors 表读取）
+        err_rows = conn.execute(
+            "SELECT code, reason, created_at FROM sync_errors ORDER BY created_at DESC"
+        ).fetchall()
+
+    latest_lag = []
+    if market_last:
+        from datetime import datetime as _dt
+        m_last = _dt.strptime(market_last, "%Y-%m-%d")
+        for code, last in lag_rows:
+            if not last:
+                continue
+            lag_days = (m_last - _dt.strptime(last, "%Y-%m-%d")).days
+            if lag_days > 3:   # 交易日的自然日约 3 天（含周末）
+                latest_lag.append({
+                    "code": code,
+                    "last_date": last,
+                    "lag_days": lag_days,
+                })
+        latest_lag.sort(key=lambda x: x["lag_days"], reverse=True)
+
+    failed = [{"code": r[0], "reason": r[1], "created_at": r[2]} for r in err_rows]
+
+    return {
+        "market_last_date": market_last,
+        "latest_lag": latest_lag,
+        "no_data": no_data,
+        "failed": failed,
+    }
