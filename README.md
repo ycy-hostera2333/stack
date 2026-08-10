@@ -8,6 +8,8 @@
 
 ## 快速开始
 
+cd "C:\Users\WYT\Documents\PycharmProjects\Stack-main"
+
 **仓库不含行情数据**——本地库有 1GB+，属于派生数据，跑一遍同步就能重建。
 
 安装依赖：
@@ -40,6 +42,52 @@ python -m venv .venv
 ```
 
 浏览器打开 http://127.0.0.1:8765
+
+---
+
+## 数据源
+
+行情抓取采用**多源自动 fallback**：单个源失败后自动切到下一个，
+单个源被限流/封禁时其他源能顶上，大幅降低"更新失败"的概率。
+
+| 优先级 | 数据源 | 协议 | 免费 | 说明 |
+|--------|--------|------|------|------|
+| 1 | **腾讯** | HTTP | ✅ | `web.ifzq.gtimg.cn`，绕开东财 CDN 封禁，无需 token |
+| 2 | **BaoStock** | TCP | ✅ | 绕过 HTTP 限流，免费无需 token |
+| 3 | **Tushare Pro** | HTTP | ✅ | 主要用于补齐退市股，**需要 token** |
+| 4 | **akshare（东财）** | HTTP | ✅ | 最全字段，但最慢、最易限流 |
+
+### Tushare Token 配置
+
+Tushare 主要用于补齐**退市股**历史数据（免费零售源都不提供）。
+到 https://tushare.pro 注册后获取 token，二选一配置：
+
+**方式 1：环境变量**（推荐）
+```bash
+set TUSHARE_TOKEN=你的token
+```
+
+**方式 2：本地文件**（已在 `.gitignore` 中，不会被提交）
+```
+c:\Users\WYT\Documents\PycharmProjects\Stack-main\.tushare_token
+```
+文件内容就是 token 本身，单独一行，**不要加引号或空格**。
+
+验证配置是否生效：
+```bash
+.venv\Scripts\python.exe -c "from stack.data.tushare_source import available; print('可用' if available() else '未配置')"
+```
+
+> **注意**：不配置 Tushare token 不影响在市股票的同步，腾讯 + BaoStock 已覆盖 99%。
+> Tushare 作为第 3 个 fallback 源，只在腾讯/BaoStock 都失败时尝试。
+
+### 同步加速与熔断
+
+- **并发 12**，**请求间隔 0.02s**，单源重试 2 次
+- **熔断机制**：某个源连续失败 N 次后自动跳过，避免在挂掉的源上死等
+  - 在网页「数据管理」页可调节熔断阈值（1~5，默认 1）
+- **多轮冷却**：第一轮扫完后，对失败的股票分别冷却 60s / 120s 后重试
+- **实时日志**：同步过程中可在网页看到每只股票从哪个源获取、取了多少行
 
 ---
 
@@ -405,8 +453,12 @@ def prepare(self, df):
 （这一点我一开始判断错了：用 24 只股票测出「12 线程最快、成功率最高」，就把并发设成了 12。
 短样本根本测不出累积限流，反而加速触发。）
 
-现在的对策：并发降到 5、每请求间隔 0.15s、重试用指数退避加抖动，
-一轮扫完后对失败的再跑两轮，中间分别冷却 60s / 120s。
+现在的对策：**多源 fallback + 熔断 + 多轮冷却**：
+
+- **腾讯 → BaoStock → Tushare → akshare** 四个源自动切换，单个源挂了不耽误
+- **熔断机制**：某个源连续失败 N 次（默认 1，可在网页调节）后自动跳过
+- **并发 12**，**请求间隔 0.02s**，单源重试 2 次
+- **多轮冷却**：第一轮扫完后，对失败的股票分别冷却 60s / 120s 后重试
 
 即便如此，首次全市场同步仍可能剩下一批取不到。等一两小时让限流恢复，然后用：
 
@@ -470,21 +522,7 @@ def prepare(self, df):
 ### 未修正的部分：行情数据
 
 **免费零售源都不提供退市股历史 K 线**——东财、新浪、本地通达信三个源实测
-367 只退市股全部取不到。要真正补上，需要 Tushare Pro：
-
-```bash
-.venv\Scripts\python.exe -m pip install tushare
-```
-
-到 https://tushare.pro 注册取 token，然后二选一：
-
-```bash
-set TUSHARE_TOKEN=你的token
-```
-
-或把 token 写进项目根目录的 `.tushare_token` 文件（已在 `.gitignore` 中，不会被提交）。
-
-配好后：
+367 只退市股全部取不到。要真正补上，需要 Tushare Pro（详见[数据源](#数据源)章节）：
 
 ```bash
 .venv\Scripts\python.exe -m stack.cli sync --delisted

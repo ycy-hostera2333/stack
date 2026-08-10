@@ -13,6 +13,10 @@ numpy>=1.26
 fastapi>=0.115
 uvicorn[standard]>=0.30
 
+# 多数据源后备：akshare（东财）被限流/封禁时，自动切换到腾讯 / BaoStock。
+# baostock 走 TCP 协议，绕开 HTTP 数据源的 CDN 封禁，免费无需 token。
+baostock>=0.9.3
+
 # 可选：仅用于补齐退市股历史行情（修正幸存者偏差）。
 # 免费源不提供退市股 K 线，实测 367 只全部取不到。
 # 需自行到 https://tushare.pro 注册获取 token，不装也不影响其余功能。
