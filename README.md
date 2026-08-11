@@ -68,9 +68,12 @@ set TUSHARE_TOKEN=你的token
 ```
 
 **方式 2：本地文件**（已在 `.gitignore` 中，不会被提交）
+
+在**项目根目录**（即本 README 所在目录）新建 `.tushare_token`：
 ```
-c:\Users\WYT\Documents\PycharmProjects\Stack-main\.tushare_token
+<项目根>\.tushare_token
 ```
+路径由 `stack/config.py` 的 `ROOT` 自动推导，项目挪到哪里就跟到哪里，不用改代码。
 文件内容就是 token 本身，单独一行，**不要加引号或空格**。
 
 验证配置是否生效：

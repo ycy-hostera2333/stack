@@ -162,6 +162,61 @@ def _f_momvol(P):
     return mom / vol.replace(0, np.nan)
 
 
+# ------------------------------------------------------------------ 基本面因子
+# 全部走 point-in-time：每个交易日只能看到**已过法定披露截止日**的报告。
+# 详见 data/fundamental.py 的说明——按报告期对齐是最隐蔽的一类前视偏差。
+def _fund(P: dict, field: str) -> pd.DataFrame:
+    """取某个基本面字段的 PIT 宽表，与价格面板对齐。"""
+    from .data import fundamental as fd
+    close = P["close"]
+    dates = close.index.strftime("%Y-%m-%d").tolist()
+    panel = fd.as_panel(field, dates, list(close.columns))
+    panel.index = close.index
+    return panel
+
+
+@factor("roe", "净资产收益率", note="盈利能力，PIT 对齐")
+def _f_roe(P):
+    return _fund(P, "roe")
+
+
+@factor("gross_margin", "销售毛利率", note="定价能力/护城河代理")
+def _f_gm(P):
+    return _fund(P, "gross_margin")
+
+
+@factor("profit_yoy", "净利润同比增长", note="成长性")
+def _f_pyoy(P):
+    return _fund(P, "profit_yoy")
+
+
+@factor("revenue_yoy", "营收同比增长", note="成长性，比净利更难粉饰")
+def _f_ryoy(P):
+    return _fund(P, "revenue_yoy")
+
+
+@factor("pb", "市净率", direction=-1,
+        note="低估值溢价。用收盘价 / 每股净资产现算，两边都是 PIT 的")
+def _f_pb(P):
+    bps = _fund(P, "bps")
+    return P["close"] / bps.where(bps > 0)
+
+
+@factor("ep", "盈利收益率(EPS/价格)", note="市盈率的倒数，避免 PE 在亏损时符号翻转")
+def _f_ep(P):
+    # 用倒数而非 PE：EPS 为负时 PE 会变成"很小的负数"，排序上反而排到前面，
+    # 是估值因子最常见的陷阱。EP 为负就是负，排序天然正确。
+    eps = _fund(P, "eps")
+    return eps / P["close"].replace(0, np.nan)
+
+
+@factor("ocf_quality", "经营现金流/每股收益", direction=1,
+        note="盈利质量：赚的钱有没有真的收回来")
+def _f_ocfq(P):
+    eps, ocf = _fund(P, "eps"), _fund(P, "ocfps")
+    return ocf / eps.where(eps.abs() > 1e-6)
+
+
 # ------------------------------------------------------------------ 评估
 def _rank_ic(f: pd.DataFrame, r: pd.DataFrame, mask: pd.DataFrame) -> pd.Series:
     """逐日横截面 Rank IC（斯皮尔曼相关）。"""
@@ -217,6 +272,21 @@ def evaluate(name: str, P: dict, horizons=(1, 5, 10, 20, 60),
     inc = sum(1 for a, b in zip(layers, layers[1:]) if b > a)
     out["monotonic"] = inc / max(len(layers) - 1, 1)
 
+    # ---- 头部超额：**这才是引擎实际能拿到的** ----
+    # 引擎按 score 取前 N 名建仓，所以决定成败的是最高分组相对全池的超额，
+    # 而不是 rank IC。IC 衡量整个横截面的单调关联，可能全部来自分布中段——
+    # 实测 vol_20 的 IC 逐年 8/8 为正，头部超额却是负的，据此设计的策略
+    # 选出来的股票平均跑输全池。用错判据比没有判据更危险。
+    top = rm.where(q > 1 - 1 / quantiles).mean(axis=1)
+    uni = rm.mean(axis=1)
+    ex = (top - uni).dropna()
+    out["top_excess"] = float(ex.mean()) if len(ex) else None
+    if len(ex):
+        by = ex.groupby(ex.index.year).mean()
+        out["top_win_years"] = int((by > 0).sum())
+        out["top_years"] = int(len(by))
+        out["top_by_year"] = {str(k): round(float(v), 4) for k, v in by.items()}
+
     # ---- 换手：最高分位组的成分变化率，决定会不会被手续费吃光 ----
     topq = (q > 1 - 1 / quantiles)
     prev = topq.shift(1)
@@ -237,14 +307,16 @@ def evaluate_all(P: dict, **kw) -> pd.DataFrame:
         ic20 = r["ic"].get(20, {})
         rows.append({
             "因子": name, "名称": r["label"],
-            "IC均值": ic20.get("mean"), "IC_IR": ic20.get("ir"),
-            "t值": ic20.get("t"), "IC>0占比": ic20.get("pos_ratio"),
+            "头部超额": r.get("top_excess"),
+            "头部赢年": (f"{r.get('top_win_years')}/{r.get('top_years')}"
+                     if r.get("top_years") else None),
             "多空价差": r["spread"], "单调性": r["monotonic"],
-            "换手率": r["turnover"],
+            "IC均值": ic20.get("mean"), "换手率": r["turnover"],
         })
     df = pd.DataFrame(rows)
-    if "IC_IR" in df:
-        df = df.sort_values("IC_IR", key=lambda s: s.abs(), ascending=False)
+    # 按「头部超额」排序而不是 IC——引擎买的是头部
+    if "头部超额" in df:
+        df = df.sort_values("头部超额", ascending=False, na_position="last")
     return df.reset_index(drop=True)
 
 

@@ -96,6 +96,18 @@ class Strategy:
     def exit(self, df: pd.DataFrame) -> pd.Series:
         raise NotImplementedError
 
+    # 多因子打分：声明「用哪些列、各占多少权重」，引擎会把每一列**按日期逐列**
+    # 转成横截面百分位排名，再加权求和。
+    #
+    # 为什么必须由引擎做：score() 只看得到单只股票的时间序列。在里面写
+    # `df["x"].rank(pct=True)` 排的是**时间**维度，而且用到了该股票的全部历史
+    # 包括未来——既不是横截面，还引入前视偏差。只有到了引擎手里才有完整的
+    # (股票 × 日期) 矩阵，那是唯一能正确做横截面归一的地方。
+    #
+    # 例：score_fields = [("f_rev_yoy", 1.0), ("f_bp", 1.0)]
+    # 留空则沿用 score() 的返回值，按原始值排序（单因子够用）。
+    score_fields: list = field(default_factory=list)
+
     def score(self, df: pd.DataFrame) -> pd.Series:
         """默认用 60 日动量排序，让强势股优先。"""
         return df.get("mom60", pd.Series(0.0, index=df.index)).fillna(-9.9)

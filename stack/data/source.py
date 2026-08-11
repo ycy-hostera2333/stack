@@ -213,13 +213,44 @@ def _fetch_akshare(code: str, start: str, end: str, adjust: str) -> pd.DataFrame
     return pd.DataFrame()
 
 
-def _fetch_tencent(code: str, start: str, end: str, adjust: str = "qfq") -> pd.DataFrame:
-    """腾讯数据源：单只股票日线。
+TENCENT_MAX_BARS = 500          # 腾讯单次请求的硬上限
 
-    移植自 Vibe-Trading 的 tencent_loader：走 web.ifzq.gtimg.cn 接口，
-    绕开东财 CDN 的 IP 封禁。免费、无需 token、无需额外依赖（urllib 即可）。
-    返回与 akshare 相同的列结构。
+
+def _fetch_tencent(code: str, start: str, end: str,
+                   adjust: str = "qfq") -> pd.DataFrame:
+    """腾讯数据源：单只股票日线，自动分段绕过单次 500 根的上限。
+
+    走 web.ifzq.gtimg.cn 接口，绕开东财 CDN 的 IP 封禁，免费无需 token。
+
+    单次请求最多返回 500 根 K 线。曾经因为没处理这个上限，
+    请求 2018-2026 只拿回最近 500 根（2024-07 起），
+    更早的数据保持不变——在本地库里表现为「2024-07 突然断层」。
     """
+    spans, cur = [], pd.to_datetime(end)
+    lo = pd.to_datetime(start)
+    # 500 个交易日约合 730 个自然日，留余量按 680 天一段往回切
+    while cur >= lo:
+        seg_start = max(lo, cur - pd.Timedelta(days=680))
+        spans.append((seg_start.strftime("%Y-%m-%d"), cur.strftime("%Y-%m-%d")))
+        if seg_start <= lo:
+            break
+        cur = seg_start - pd.Timedelta(days=1)
+
+    parts = [_fetch_tencent_span(code, a, b, adjust) for a, b in spans]
+    parts = [p for p in parts if p is not None and not p.empty]
+    if not parts:
+        return pd.DataFrame()
+    out = (pd.concat(parts, ignore_index=True)
+             .drop_duplicates(subset=["date"])
+             .sort_values("date").reset_index(drop=True))
+    # 分段拼接后 pct_chg 在段边界会断，统一重算一次
+    out["pct_chg"] = out["close"].pct_change() * 100
+    return out
+
+
+def _fetch_tencent_span(code: str, start: str, end: str,
+                        adjust: str = "qfq") -> pd.DataFrame:
+    """腾讯源单段请求（<= 500 根）。"""
     import json
     import urllib.request
 
@@ -233,7 +264,7 @@ def _fetch_tencent(code: str, start: str, end: str, adjust: str = "qfq") -> pd.D
     start_iso = pd.to_datetime(start).strftime("%Y-%m-%d")
     end_iso = pd.to_datetime(end).strftime("%Y-%m-%d")
     url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
-           f"param={tcode},day,{start_iso},{end_iso},500,{qfq}")
+           f"param={tcode},day,{start_iso},{end_iso},{TENCENT_MAX_BARS},{qfq}")
 
     for attempt in range(RETRY):
         try:
@@ -277,9 +308,20 @@ def _fetch_tencent(code: str, start: str, end: str, adjust: str = "qfq") -> pd.D
             df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
             for c in ("open", "high", "low", "close", "volume"):
                 df[c] = pd.to_numeric(df[c], errors="coerce")
-            # 腾讯不返回成交额/涨跌幅/换手率，置空
-            df["amount"] = pd.NA
-            df["pct_chg"] = pd.NA
+            df = df.sort_values("date").reset_index(drop=True)
+
+            # 腾讯的 K 线只有 6 个字段（日期/开/收/高/低/量），没有成交额、
+            # 涨跌幅、换手率。直接置空会造成静默灾难：universe.build 用
+            # 20 日均成交额筛流动性，amount 全 NULL 会让股票池只剩十几只，
+            # 2024-07 之后的回测全部返回空——而且不报任何错。所以必须补算。
+            #
+            # pct_chg 由收盘价精确推出（同一复权序列，无误差）。
+            # amount 只能估算：成交量(手) × 100 × 均价，用收盘价代理均价。
+            # 实测 amount/(volume×close) ≈ 100，说明这个代理够准；
+            # 而它只用于「是否超过 5000 万」这类流动性门槛，几个百分点的
+            # 误差无关紧要。turnover 需要流通股本，这里给不出，保持为空。
+            df["pct_chg"] = df["close"].pct_change() * 100
+            df["amount"] = df["volume"] * 100.0 * df["close"]
             df["turnover"] = pd.NA
             return df.dropna(subset=["close"])
         except Exception:

@@ -432,6 +432,91 @@ class Defensive(Strategy):
 
 
 @register
+class GrowthValue(Strategy):
+    name = "growth_value"
+    label = "成长+价值"
+    description = (
+        "按「头部分组超额收益」这个判据重建的——引擎按打分取前 N 名建仓，"
+        "所以决定成败的是最高分组能拿到什么，不是 rank IC。"
+        "用错判据的代价已经吃过一次：vol_20 的 IC 逐年 8/8 为正，"
+        "头部超额却是 -0.29%，据此建的 defensive 选出的股票平均跑输全池。\n"
+        "打分 = 营收同比增长 + 账面市值比(BP)，各取横截面百分位后等权相加。"
+        "两者相关性 -0.18（负相关），成长与价值是真正对立的风格，"
+        "组合是实打实的分散而非同一赌注押两次。\n"
+        "基本面数据严格 point-in-time：只用已过法定披露截止日的报告。\n"
+        "⚠ 实测头部超额 +0.44%/20日、逐年 8/8 为正，但修正 t 值仅 1.25（不显著），"
+        "且是在测了 19 个因子、8 种组合后挑出来的。**未经样本外验证，不构成有效性证据。**"
+    )
+    # 两个分量交给引擎做横截面百分位归一后等权相加。
+    # 不能在 score() 里自己 rank——那排的是时间维度，还会用到未来数据。
+    score_fields = [("f_rev_yoy", 1.0), ("f_bp", 1.0)]
+    defaults = {
+        "index_ma": 0,            # 大盘择时，0=关闭（实测只降回撤不提收益）
+        "w_growth": 1.0,          # 权重：营收增长
+        "w_value": 1.0,           # 权重：账面市值比
+        "min_amount": 0.0,        # 额外流动性下限（元），0=沿用股票池设置
+        "max_pb": 0.0,            # 市净率上限，0=不限。防止买到净资产为负的壳
+    }
+    param_meta = {
+        "index_ma": {"label": "大盘择时均线", "min": 0, "max": 400, "step": 10,
+                     "hint": "0=关闭。实测择时只改善回撤，不提高跑赢基准的年份数"},
+        "w_growth": {"label": "权重·营收增长", "min": 0, "max": 3, "step": 0.1},
+        "w_value": {"label": "权重·账面市值比", "min": 0, "max": 3, "step": 0.1},
+        "max_pb": {"label": "市净率上限", "min": 0, "max": 30, "step": 0.5,
+                   "hint": "0=不限。设 10 可滤掉估值极端的标的"},
+    }
+
+    def warmup_bars(self) -> int:
+        return 70          # 只需要够算 MA60 和流动性，基本面不依赖长历史
+
+    def market_regime(self, dates):
+        n = int(self.params["index_ma"])
+        return index_above_ma(dates, "IDX000300", n) if n > 0 else None
+
+    def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = super().prepare(df)
+        from ..data import fundamental as fd
+        code = str(df["code"].iloc[0])
+        dates = df["date"].dt.strftime("%Y-%m-%d").tolist()
+        for field, col in (("revenue_yoy", "f_rev_yoy"), ("bps", "f_bps")):
+            panel = fd.as_panel(field, dates, [code])
+            df[col] = panel[code].to_numpy() if code in panel.columns else np.nan
+        # BP = 每股净资产 / 价格。用 BP 而不是 PB：PB 在净资产为负时会变成
+        # "很小的负数"，排序上反而排到前面，是估值因子最常见的陷阱。
+        df["f_bp"] = df["f_bps"] / df["close"].replace(0, np.nan)
+        return df
+
+    def entry(self, df: pd.DataFrame) -> pd.Series:
+        p = self.params
+        ok = df["f_rev_yoy"].notna() & df["f_bp"].notna() & (df["f_bps"] > 0)
+        if float(p["max_pb"]) > 0:
+            ok &= df["f_bp"] >= 1.0 / float(p["max_pb"])
+        return safe(ok)
+
+    def exit(self, df: pd.DataFrame) -> pd.Series:
+        # 不设结构性离场：靠「最长持有(日)」定期调仓重排。
+        # 因子在 20 日前瞻收益上测得，调仓周期应与之一致。
+        return safe(pd.Series(False, index=df.index))
+
+    def score(self, df: pd.DataFrame) -> pd.Series:
+        # 实际打分由引擎按 score_fields 做横截面归一后合成，这里只是占位。
+        # 权重通过 __init__ 写回 score_fields，使界面上调参能生效。
+        return pd.Series(0.0, index=df.index)
+
+    def __init__(self, **params):
+        super().__init__(**params)
+        self.score_fields = [("f_rev_yoy", float(self.params["w_growth"])),
+                             ("f_bp", float(self.params["w_value"]))]
+
+    def reason(self, row: pd.Series, action: str) -> str:
+        if action == "BUY":
+            pb = (1.0 / row["f_bp"]) if row.get("f_bp") else float("nan")
+            return (f"营收同比 {row['f_rev_yoy']:+.1f}%，"
+                    f"市净率 {pb:.2f}（BP {row['f_bp']:.3f}）")
+        return "调仓期到，重排候选"
+
+
+@register
 class TurtleBreakout(Strategy):
     name = "turtle_breakout"
     label = "唐奇安通道突破"

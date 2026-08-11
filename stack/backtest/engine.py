@@ -131,6 +131,9 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
     cols: dict[str, list[np.ndarray]] = {
         k: [] for k in ("open", "high", "close", "atr", "score")}
     flags: dict[str, list[np.ndarray]] = {k: [] for k in ("entry", "exit", "valid")}
+    # 多因子打分声明的原始列，逐股票收集，最后由引擎做横截面归一
+    score_cols = [n for n, _ in getattr(strategy, "score_fields", []) or []]
+    extra_lists: dict[str, list[np.ndarray]] = {n: [] for n in score_cols}
 
     for code, g in raw.groupby("code", sort=False):
         g = store.usable_history(g.sort_values("date"))
@@ -160,6 +163,12 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
         row["atr"][pos] = d["atr14"].to_numpy()[sel]
         row["score"][pos] = score[sel]
 
+        for name in score_cols:
+            arr = np.full(n_d, np.nan, dtype=np.float32)
+            if name in d.columns:
+                arr[pos] = pd.to_numeric(d[name], errors="coerce").to_numpy()[sel]
+            extra_lists[name].append(arr)
+
         e = np.zeros(n_d, dtype=bool); e[pos] = entry[sel]
         x = np.zeros(n_d, dtype=bool); x[pos] = exit_[sel]
         v = np.zeros(n_d, dtype=bool); v[pos] = True
@@ -175,7 +184,43 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
         return None
     arrays = {k: np.vstack(v) for k, v in cols.items()}
     arrays.update({k: np.vstack(v) for k, v in flags.items()})
+    extra = {k: np.vstack(v) for k, v in extra_lists.items() if v}
+
+    fields = getattr(strategy, "score_fields", None)
+    if fields:
+        # 每个分量按日期逐列转成横截面百分位排名，再加权求和。
+        # 这是唯一能正确归一的地方——策略里只看得到单只股票的时序，
+        # 在那里做 rank 排的是时间维度且会用到未来数据。
+        total = np.zeros_like(arrays["score"], dtype=np.float32)
+        wsum = 0.0
+        for name, w in fields:
+            m = extra.get(name)
+            if m is None:
+                continue
+            total += w * _cross_rank(m, arrays["valid"])
+            wsum += w
+        arrays["score"] = (total / wsum if wsum else total).astype(np.float32)
+        arrays["score"][~arrays["valid"]] = -9.9
+
     return Panel(keep_codes, dates, arrays)
+
+
+def _cross_rank(mat: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """把 (股票 × 日期) 矩阵按日期逐列转成 [0,1] 的横截面百分位排名。
+
+    无效值（NaN 或当日不可交易）不参与排名，统一给 0。
+    """
+    s = mat.astype(np.float64).copy()
+    s[~valid] = np.nan
+    bad = np.isnan(s)
+    filled = np.where(bad, -np.inf, s)
+    order = np.argsort(np.argsort(filled, axis=0), axis=0).astype(np.float64)
+    n_valid = (~bad).sum(axis=0)
+    # argsort 把 -inf 排在最前，有效值的名次要减掉无效值个数
+    order -= (s.shape[0] - n_valid)[None, :]
+    pct = np.where(n_valid[None, :] > 1,
+                   order / np.maximum(n_valid[None, :] - 1, 1), 0.5)
+    return np.where(bad, 0.0, pct).astype(np.float32)
 
 
 def _benchmark(start: str, end: str, symbol: str = "IDX000300") -> pd.Series | None:

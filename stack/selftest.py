@@ -314,6 +314,39 @@ def _t_data():
     return f"{cov['bars']:,} 根 K 线，{cov['codes_with_data']} 只"
 
 
+@check("数据：成交额列完整（缺失会让股票池静默塌陷）")
+def _t_amount():
+    cov = store.coverage()
+    if not cov["bars"]:
+        return "跳过：本地还没有数据"
+    with store.connect() as c:
+        rows = c.execute("""
+            SELECT substr(date,1,7) ym, COUNT(*),
+                   SUM(CASE WHEN amount IS NULL OR amount<=0 THEN 1 ELSE 0 END)
+            FROM daily WHERE code NOT LIKE 'IDX%'
+            GROUP BY ym ORDER BY ym""").fetchall()
+    bad = [(ym, n, m) for ym, n, m in rows if n > 500 and m / n > 0.30]
+    total_missing = sum(m for _, _, m in rows) / max(sum(n for _, n, _ in rows), 1)
+
+    # 曾经踩过：腾讯源只返回 6 个字段（无成交额），而它排在 fallback 首位，
+    # 结果 2024-07 之后 99% 的行 amount 为 NULL。universe.build 用 20 日均成交额
+    # 筛流动性，于是股票池从两千多只塌成 17 只，2025 年之后的回测全部返回空——
+    # 全程不报任何错。这一项就是为了让这种事下次立刻暴露。
+    assert not bad, (
+        f"{len(bad)} 个月份的成交额缺失超过 30%，最早 {bad[0][0]}"
+        f"（{bad[0][2]}/{bad[0][1]}）。股票池会因此塌陷，回测结果不可信。")
+
+    # 顺带验证量纲：amount ≈ volume(手) × 100 × 均价
+    with store.connect() as c:
+        r = c.execute("""
+            SELECT AVG(amount/(volume*close)) FROM daily
+            WHERE code NOT LIKE 'IDX%' AND volume>0 AND close>0
+              AND amount>0 AND date>=date('now','-60 day')""").fetchone()[0]
+    if r is not None:
+        assert 50 < r < 200, f"amount/(volume×close) = {r:.1f}，量纲异常（应≈100）"
+    return f"整体缺失 {total_missing:.1%}，量纲比值 {r:.0f}" if r else "通过"
+
+
 @check("数据：负价历史被正确截断（前复权价可为负，不能喂给指标）")
 def _t_nonpositive():
     with store.connect() as c:
