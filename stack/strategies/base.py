@@ -128,6 +128,36 @@ class Strategy:
         }
 
 
+def blend_score_fields(values: dict[str, dict[str, float]],
+                       fields: list[tuple[str, float]]) -> dict[str, float]:
+    """把 {代码: {字段: 值}} 按字段做横截面百分位归一后加权合成，返回 {代码: 分数}。
+
+    打分型策略（声明了 score_fields 的）自己的 score() 只是返回 0 的占位符——
+    在策略内部只看得到单只股票的时序，在那里排序排的是时间维度、还会用到未来数据。
+    真正的合成必须在拿齐当日全部候选之后做，也就是回测引擎、模拟盘、每日信号
+    这三个地方各做一次。
+
+    漏掉任何一处都不会报错：候选全是 0 分，"按打分取前 N 名"静默退化成
+    "按代码序取前 N 名"。模拟盘和每日信号都曾经漏掉过。
+
+    口径与引擎的 _cross_rank 一致：有效值归一到 [0,1]，缺失记 0 分。
+    """
+    codes = list(values)
+    if not codes:
+        return {}
+    total = pd.Series(0.0, index=codes, dtype="float64")
+    wsum = 0.0
+    for col, w in fields:
+        v = pd.Series({c: values[c].get(col, float("nan")) for c in codes},
+                      dtype="float64")
+        pct = (v.rank(method="average") - 1) / max(v.notna().sum() - 1, 1)
+        total += w * pct.fillna(0.0)
+        wsum += w
+    if wsum:
+        total /= wsum
+    return {c: float(total[c]) for c in codes}
+
+
 def get_strategy(name: str, **params) -> Strategy:
     if name not in REGISTRY:
         raise KeyError(f"未知策略 {name!r}，可用：{sorted(REGISTRY)}")

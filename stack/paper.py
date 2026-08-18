@@ -18,6 +18,7 @@ import pandas as pd
 from .config import LOT_SIZE, buy_cost, price_limit, sell_cost
 from .data import store, universe
 from .strategies import get_strategy
+from .strategies.base import blend_score_fields
 
 EPS = 1e-6
 
@@ -80,31 +81,10 @@ def reset(strategy: str = "regime_momentum", params: dict | None = None,
 
 
 def _apply_score_fields(sig: dict, fields: list) -> None:
-    """多因子打分：逐字段做横截面百分位归一后加权相加，与回测引擎口径一致。
-
-    这一步必须在拿到全部候选之后做。策略的 score() 只看得到单只股票的时序，
-    在那里排序排的是时间维度、还会用到未来数据——所以 score_fields 类策略的
-    score() 都是返回 0 的占位符，真正的合成在引擎（回测）和这里（模拟盘）。
-
-    曾经这里直接用 strategy.score()，于是 growth_value 的候选全是 0 分，
-    "按打分取前 N 名"静默退化成"按代码序取前 N 名"，不报错、也看不出来。
-    """
-    codes = list(sig)
-    if not codes:
-        return
-    total = pd.Series(0.0, index=codes, dtype="float64")
-    wsum = 0.0
-    for col, w in fields:
-        v = pd.Series({c: sig[c]["fields"].get(col, float("nan")) for c in codes},
-                      dtype="float64")
-        # 与引擎 _cross_rank 一致：有效值归一到 [0,1]，缺失记 0 分
-        pct = (v.rank(method="average") - 1) / max(v.notna().sum() - 1, 1)
-        total += w * pct.fillna(0.0)
-        wsum += w
-    if wsum:
-        total /= wsum
-    for c in codes:
-        sig[c]["score"] = float(total[c])
+    """把横截面合成的分数写回候选表。合成口径见 strategies.base.blend_score_fields。"""
+    scores = blend_score_fields({c: v["fields"] for c, v in sig.items()}, fields)
+    for c, v in scores.items():
+        sig[c]["score"] = v
 
 
 def _holdings() -> dict:
@@ -136,6 +116,11 @@ def advance(as_of: str | None = None, verbose: bool = True) -> dict:
         today = datetime.now().strftime("%Y-%m-%d")
         if as_of == today and not source.market_closed_today():
             as_of = days[-2] if len(days) > 1 else None
+        # 残日（同步中断留下的几行）不能拿来建仓：其余几千只会被判成停牌，
+        # 模拟盘会照着一份残缺的候选名单下单，而且不报错。
+        complete = store.last_complete_day()
+        if as_of and complete and as_of > complete:
+            as_of = complete
     if as_of is None:
         return {"skipped": "没有已收盘的交易日"}
 

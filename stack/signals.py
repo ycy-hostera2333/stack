@@ -17,7 +17,7 @@ import pandas as pd
 from .config import LOT_SIZE
 from .data import source, store, universe
 from .strategies import base as base_mod
-from .strategies.base import Strategy
+from .strategies.base import Strategy, blend_score_fields
 
 
 @dataclass
@@ -42,6 +42,12 @@ def _latest_usable_date(allow_partial: bool = False) -> tuple[str | None, bool]:
         return last, False
     if last == datetime.now().strftime("%Y-%m-%d") and not source.market_closed_today():
         return (days[-2] if len(days) >= 2 else None), True
+    # 中断的同步会在库尾留下只有几只股票的残日。上面那条只防"今天未收盘"，
+    # 防不住几天前留下的残日——那种情况下几千只会被当成当日停牌，
+    # 候选静默缩成几只。这里回退到最后一个数据完整的交易日。
+    complete = store.last_complete_day()
+    if complete and complete != last:
+        return complete, True
     return last, False
 
 
@@ -86,6 +92,10 @@ def generate(strategy: Strategy, flt: universe.UniverseFilter | None = None,
         if idx_last is None or idx_last < as_of:
             regime_stale = idx_last
 
+    # 打分型策略的分数要等拿齐全部候选后再横截面合成，见 blend_score_fields
+    score_fields = list(getattr(strategy, "score_fields", None) or [])
+    field_vals: dict[str, dict[str, float]] = {}
+
     buys, sells, errors = [], [], 0
     for code, g in raw.groupby("code", sort=False):
         g = store.usable_history(g.sort_values("date"))
@@ -101,6 +111,7 @@ def generate(strategy: Strategy, flt: universe.UniverseFilter | None = None,
                     "price": round(float(row["close"]), 2),
                     "score": float(strategy.score(d).iloc[-1]),
                     "reason": strategy.reason(row, "BUY"),
+                    "_row": row,
                     "ma20": round(float(row.get("ma20", float("nan"))), 2),
                     "rsi14": round(float(row.get("rsi14", float("nan"))), 1),
                     "vol_ratio": round(float(row.get("vol_ratio", float("nan"))), 2),
@@ -116,6 +127,16 @@ def generate(strategy: Strategy, flt: universe.UniverseFilter | None = None,
         except Exception:
             errors += 1
             continue
+
+    if score_fields:
+        vals = {b["code"]: {col: float(b["_row"][col])
+                            for col, _w in score_fields if col in b["_row"].index}
+                for b in buys}
+        scores = blend_score_fields(vals, score_fields)
+        for b in buys:
+            b["score"] = scores.get(b["code"], 0.0)
+    for b in buys:
+        b.pop("_row", None)
 
     buys.sort(key=lambda x: -x["score"])
     buys = buys[: cfg.max_candidates]

@@ -343,10 +343,11 @@ def _t_paper_equiv():
     return "；".join(notes)
 
 
-@check("模拟盘：打分型策略的候选分数必须有区分度（不能全同分）")
-def _t_paper_score_spread():
-    """score_fields 类策略的 score() 是占位符，真正的合成在引擎和 paper 里各做一次。
-    漏掉任何一处都不会报错，只会让「按打分取前 N」静默变成「按代码序取前 N」。"""
+@check("打分：打分型策略在模拟盘与每日信号里都必须真正打分")
+def _t_score_spread():
+    """score_fields 类策略的 score() 是占位符，真正的横截面合成要在
+    引擎、模拟盘、每日信号三处各做一次。漏掉任何一处都不报错，
+    只会让「按打分取前 N 名」静默退化成「按代码序取前 N 名」。"""
     from . import paper
 
     st = get_strategy("growth_value")
@@ -362,7 +363,23 @@ def _t_paper_score_spread():
     vals = sorted(v["score"] for v in sig.values())
     assert len(set(round(v, 6) for v in vals)) > 1,         "候选分数全部相同——打分没有真正生效"
     assert 0.0 <= vals[0] and vals[-1] <= 1.0,         f"归一后应落在 [0,1]，实际 {vals[0]:.3f}~{vals[-1]:.3f}"
-    return f"40 只候选得到 {len(set(round(v,6) for v in vals))} 个不同分数"
+    n_distinct = len(set(round(v, 6) for v in vals))
+
+    # 每日信号是实际据以决策的那一页，端到端跑一遍。
+    # 收紧流动性下限只是为了让这项检查跑得快，不影响判据。
+    from . import signals as sig_mod
+    res = sig_mod.generate(get_strategy("growth_value"),
+                           universe.UniverseFilter(min_amount=3e9),
+                           sig_mod.SignalConfig(max_candidates=20))
+    picks = res.get("buys") or []
+    if len(picks) < 5:
+        return f"合成正确（{n_distinct} 个不同分数）；每日信号候选不足，未端到端验证"
+    scores = [b["score"] for b in picks]
+    assert len(set(scores)) > 1,         f"每日信号的 {len(picks)} 个候选分数全部相同——打分没有生效，等于按代码序排"
+    codes = [b["code"] for b in picks]
+    assert codes != sorted(codes),         "每日信号候选恰好按代码升序，几乎可以肯定是没有真正排序"
+    return (f"合成 {n_distinct} 个不同分数；"
+            f"每日信号 {len(picks)} 个候选、{len(set(scores))} 个不同分数")
 
 
 @check("股票池：历史不足时必须报错，不能静默跳过流动性过滤")
@@ -441,6 +458,35 @@ def _t_amount():
     return f"整体缺失 {total_missing:.1%}，量纲比值 {r:.0f}" if r else "通过"
 
 
+@check("数据：库尾的残日必须被挡在信号与模拟盘之外")
+def _t_partial_tail():
+    """同步中断会在库尾留下只有几只股票的残日。它照样是 trading_days() 的最后一项，
+    于是几千只被判成当日停牌，候选静默缩成几只——不报错。
+    实测 2026-08-12 库里只有 6 行，前一交易日 4577 行。"""
+    from . import signals as sig_mod
+
+    with store.connect() as c:
+        rows = c.execute("SELECT date, COUNT(*) FROM daily GROUP BY date "
+                         "ORDER BY date DESC LIMIT 30").fetchall()
+    if len(rows) < 5:
+        return "跳过：交易日不足"
+    counts = sorted(n for _, n in rows)
+    med = counts[len(counts) // 2]
+
+    complete = store.last_complete_day()
+    assert complete is not None, "last_complete_day 不应为空"
+    got = dict(rows)[complete]
+    assert got >= med * 0.5,         f"选中的 {complete} 只有 {got} 行，不到近期中位数 {med} 的一半"
+
+    used, _ = sig_mod._latest_usable_date()
+    assert used is None or dict(rows).get(used, med) >= med * 0.5,         f"每日信号用了残日 {used}（{dict(rows).get(used)} 行，中位数 {med}）"
+
+    tail = rows[0][0]
+    if tail != complete:
+        return f"库尾 {tail} 只有 {rows[0][1]} 行，已回退到 {complete}（{got} 行）"
+    return f"库尾 {tail} 完整（{got} 行，中位数 {med}）"
+
+
 @check("数据：负价历史被正确截断（前复权价可为负，不能喂给指标）")
 def _t_nonpositive():
     with store.connect() as c:
@@ -483,7 +529,15 @@ def _t_partial_bar():
         assert skipped and as_of == days[-2], (
             f"当前未收盘却仍在用当日 K 线：as_of={as_of}")
         return f"已回退到 {as_of}（当前未收盘）"
-    assert as_of == days[-1] and not skipped
+    # 库尾可能是同步中断留下的残日，那种情况下回退是对的，由上一项检查负责
+    complete = store.last_complete_day()
+    if complete and complete != days[-1]:
+        assert skipped and as_of == complete, (
+            f"库尾 {days[-1]} 是残日，应回退到 {complete}，实际 as_of={as_of}")
+        return f"库尾是残日，已回退到 {as_of}"
+    assert as_of == days[-1] and not skipped, (
+        f"已收盘且库尾完整，应当直接用 {days[-1]}，"
+        f"实际 as_of={as_of}、skipped={skipped}")
     return f"使用 {as_of}（已收盘或非交易日）"
 
 

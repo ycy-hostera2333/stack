@@ -295,6 +295,33 @@ def usable_history(g: pd.DataFrame) -> pd.DataFrame:
     return g.iloc[last_bad + 1:]
 
 
+def last_complete_day(min_ratio: float = 0.5, lookback: int = 30) -> str | None:
+    """最后一个**数据完整**的交易日。
+
+    中断的同步会在库尾留下只有几只股票的残日。它照样出现在 trading_days() 末尾，
+    于是「最后一个交易日」就变成那一天，其余几千只全被判成当日停牌——
+    每日信号的候选从几百只缩成几只、模拟盘会照着这份残缺名单建仓，全程不报错。
+    实测 2026-08-12 库里只有 6 行，而前一交易日是 4577 行。
+
+    注意这与 signals 里那个「跳过未收盘的当日 K 线」是两回事：那一条只防今天，
+    这一条防的是任何时候留下的残日，哪怕它已经是几天前的事。
+
+    判据：当日条数不低于近 lookback 个交易日中位数的 min_ratio。
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT date, COUNT(*) FROM daily GROUP BY date "
+            "ORDER BY date DESC LIMIT ?", (lookback,)).fetchall()
+    if not rows:
+        return None
+    counts = sorted(n for _, n in rows)
+    med = counts[len(counts) // 2]
+    for d, n in rows:                     # rows 已按日期降序
+        if n >= med * min_ratio:
+            return d
+    return None
+
+
 def trading_days(start: str | None = None, end: str | None = None) -> list[str]:
     """本地库里出现过的所有交易日。"""
     sql = "SELECT DISTINCT date FROM daily WHERE 1=1"
