@@ -62,7 +62,7 @@ def _set(k, v):
 
 def reset(strategy: str = "regime_momentum", params: dict | None = None,
           cash: float = 200_000, max_positions: int = 5,
-          top: int = 400) -> dict:
+          top: int = 400, max_hold_days: int = 0) -> dict:
     """新建/重置模拟盘。会清空已有记录。"""
     _init()
     get_strategy(strategy, **(params or {}))      # 先校验参数合法
@@ -72,10 +72,39 @@ def reset(strategy: str = "regime_momentum", params: dict | None = None,
     for k, v in [("strategy", strategy), ("params", json.dumps(params or {})),
                  ("cash", cash), ("initial_cash", cash),
                  ("max_positions", max_positions), ("top", top),
+                 ("max_hold_days", max_hold_days),
                  ("last_date", ""), ("created_at",
                                      datetime.now().strftime("%Y-%m-%d %H:%M:%S"))]:
         _set(k, v)
     return status()
+
+
+def _apply_score_fields(sig: dict, fields: list) -> None:
+    """多因子打分：逐字段做横截面百分位归一后加权相加，与回测引擎口径一致。
+
+    这一步必须在拿到全部候选之后做。策略的 score() 只看得到单只股票的时序，
+    在那里排序排的是时间维度、还会用到未来数据——所以 score_fields 类策略的
+    score() 都是返回 0 的占位符，真正的合成在引擎（回测）和这里（模拟盘）。
+
+    曾经这里直接用 strategy.score()，于是 growth_value 的候选全是 0 分，
+    "按打分取前 N 名"静默退化成"按代码序取前 N 名"，不报错、也看不出来。
+    """
+    codes = list(sig)
+    if not codes:
+        return
+    total = pd.Series(0.0, index=codes, dtype="float64")
+    wsum = 0.0
+    for col, w in fields:
+        v = pd.Series({c: sig[c]["fields"].get(col, float("nan")) for c in codes},
+                      dtype="float64")
+        # 与引擎 _cross_rank 一致：有效值归一到 [0,1]，缺失记 0 分
+        pct = (v.rank(method="average") - 1) / max(v.notna().sum() - 1, 1)
+        total += w * pct.fillna(0.0)
+        wsum += w
+    if wsum:
+        total /= wsum
+    for c in codes:
+        sig[c]["score"] = float(total[c])
 
 
 def _holdings() -> dict:
@@ -123,6 +152,7 @@ def advance(as_of: str | None = None, verbose: bool = True) -> dict:
     cash = float(_meta("cash"))
     max_pos = int(_meta("max_positions"))
     top = int(_meta("top"))
+    max_hold = int(_meta("max_hold_days", 0) or 0)
     holds = _holdings()
 
     # ---------------- 数据：股票池 + 持仓，窗口够算指标即可 ----------------
@@ -133,6 +163,7 @@ def advance(as_of: str | None = None, verbose: bool = True) -> dict:
     start = (pd.Timestamp(as_of) - pd.Timedelta(days=need)).strftime("%Y-%m-%d")
     raw = store.load_daily(codes=sorted(codes), start=start, end=as_of)
 
+    score_fields = list(getattr(strat, "score_fields", None) or [])
     bars, sig = {}, {}
     for code, g in raw.groupby("code", sort=False):
         g = store.usable_history(g.sort_values("date"))
@@ -148,9 +179,15 @@ def advance(as_of: str | None = None, verbose: bool = True) -> dict:
             sig[code] = {"entry": bool(strat.entry(d).loc[prev]),
                          "exit": bool(strat.exit(d).loc[prev]),
                          "score": float(strat.score(d).loc[prev]),
-                         "row": d.loc[prev]}
+                         "row": d.loc[prev],
+                         "fields": {col: float(d.loc[prev, col])
+                                    for col, _w in score_fields
+                                    if col in d.columns}}
         except Exception:
             continue
+
+    if score_fields:
+        _apply_score_fields(sig, score_fields)
 
     # 大盘择时
     reg = strat.market_regime(days[:i])
@@ -175,7 +212,12 @@ def advance(as_of: str | None = None, verbose: bool = True) -> dict:
         if s is None or o is None or pc is None:
             events["blocked"].append(f"{code} 停牌或数据缺失，无法处理")
             continue
-        if not s["exit"] or h["hold_days"] < 1:
+        if h["hold_days"] < 1:
+            continue
+        # 到期调仓：growth_value 这类策略 exit() 恒为 False，靠持有期上限重排。
+        # 没有这一条，它会买满仓位后永远不动——不报错，只是从此不再是那个策略。
+        expired = max_hold > 0 and h["hold_days"] >= max_hold
+        if not s["exit"] and not expired:
             continue
         if o <= pc * (1 - price_limit(code, h["name"])) + EPS:
             events["blocked"].append(f"{code} {h['name']} 开盘跌停，卖不出")
@@ -184,7 +226,8 @@ def advance(as_of: str | None = None, verbose: bool = True) -> dict:
         proceeds = gross - sell_cost(gross)
         cash += proceeds
         pnl = proceeds - h["cost"] * h["shares"]
-        reason = strat.reason(s["row"], "SELL")
+        reason = (f"持有满 {max_hold} 日到期" if expired and not s["exit"]
+                  else strat.reason(s["row"], "SELL"))
         with store.connect() as c:
             c.execute("""INSERT INTO paper_trade (code,name,open_date,close_date,shares,
                 open_price,close_price,pnl,pnl_pct,hold_days,open_reason,close_reason)
@@ -297,6 +340,7 @@ def status() -> dict:
     out = {"strategy": _meta("strategy"), "params": json.loads(_meta("params", "{}")),
            "initial_cash": init_cash, "cash": float(_meta("cash", 0) or 0),
            "max_positions": int(_meta("max_positions", 5) or 5),
+           "max_hold_days": int(_meta("max_hold_days", 0) or 0),
            "created_at": _meta("created_at"), "last_date": _meta("last_date"),
            "days": len(eq), "holdings": hold.to_dict("records"),
            "closed_trades": len(tr)}

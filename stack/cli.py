@@ -205,9 +205,12 @@ def cmd_paper(args) -> None:
 
     if args.action == "init":
         params = json.loads(args.params) if args.params else {}
-        paper.reset(args.strategy, params, args.cash, args.max_positions, args.top)
+        paper.reset(args.strategy, params, args.cash, args.max_positions,
+                    args.top, args.max_hold_days)
         print(f"模拟盘已建立：{args.strategy}  本金 {args.cash:,.0f}  "
-              f"{args.max_positions} 仓位  股票池前 {args.top} 只")
+              f"{args.max_positions} 仓位  股票池前 {args.top} 只  "
+              + (f"每 {args.max_hold_days} 日调仓" if args.max_hold_days
+                 else "无持有期上限"))
         if args.since:
             print(f"回补 {args.since} 至今…")
             # 必须按日期升序逐日推进：advance 会把 last_date 前移，
@@ -368,6 +371,10 @@ def main(argv=None) -> int:
     pp.add_argument("--cash", type=float, default=200_000)
     pp.add_argument("--max-positions", type=int, default=5)
     pp.add_argument("--top", type=int, default=400, help="股票池取流动性前 N 只")
+    pp.add_argument("--max-hold-days", type=int, default=0,
+                    help="持有期上限，到期卖出重排。0=不限。"
+                         "exit() 恒为 False 的打分型策略（如 growth_value）必须设，"
+                         "否则买满后永远不调仓")
     pp.add_argument("--since", help="init 时从该日期开始回补，如 2026-06-01")
     pp.set_defaults(func=cmd_paper)
 

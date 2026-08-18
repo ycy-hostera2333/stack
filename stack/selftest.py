@@ -237,9 +237,61 @@ def _t_limits():
 
 
 # ------------------------------------------------------------------ 数据
+_PAPER_TABLES = ("paper_meta", "paper_holding", "paper_trade", "paper_equity")
+
+
+def _paper_snapshot() -> dict:
+    """整表备份模拟盘。自检要跑 paper.reset，而 reset 会清空所有记录——
+    只备份 meta 是不够的：持仓、成交、净值曲线一样会被冲掉，而那些是不可再生的
+    前向记录（模拟盘的全部价值就在于它不可回溯）。"""
+    from . import paper
+    paper._init()
+    with store.connect() as c:
+        return {t: c.execute(f"SELECT * FROM {t}").fetchall() for t in _PAPER_TABLES}
+
+
+def _paper_restore(snap: dict) -> None:
+    from . import paper
+    paper._init()
+    with store.connect() as c:
+        for t in _PAPER_TABLES:
+            rows = snap.get(t) or []
+            c.execute(f"DELETE FROM {t}")
+            if rows:
+                ph = ",".join("?" * len(rows[0]))
+                c.executemany(f"INSERT INTO {t} VALUES ({ph})", rows)
+
+
+def _paper_vs_engine(strategy: str, params: dict, cfg: engine.BacktestConfig,
+                     fdf, codes, names, eng_start, start, end, top):
+    """同一股票池、同一区间跑引擎与模拟盘，返回两边的成交明细。"""
+    from . import paper
+    from .data import universe as uni_mod
+
+    st = get_strategy(strategy, **params)
+    r = engine.run(st, codes, eng_start, end, cfg, names)
+
+    orig = uni_mod.build
+    uni_mod.build = lambda flt=None, as_of=None: fdf
+    try:
+        paper.reset(strategy, params, cfg.initial_cash, cfg.max_positions,
+                    top, cfg.max_hold_days)
+        for d in store.trading_days(start=start, end=end):
+            paper.advance(as_of=d, verbose=False)
+        with store.connect() as c:
+            pt = pd.read_sql("SELECT code,open_date,close_date,shares,pnl "
+                             "FROM paper_trade", c)
+    finally:
+        uni_mod.build = orig
+
+    et = pd.DataFrame([{"code": t.code, "open_date": t.open_date,
+                        "close_date": t.close_date, "shares": t.shares,
+                        "pnl": round(t.pnl, 2)} for t in r.trades])
+    return et, pt
+
+
 @check("模拟盘：与回测引擎逐笔等价（同一股票池、同一区间）")
 def _t_paper_equiv():
-    from . import paper
     from .data import universe as uni_mod
 
     days = store.trading_days()
@@ -256,45 +308,87 @@ def _t_paper_equiv():
     names = dict(zip(fixed["code"], fixed["name"]))
     fdf = fixed[fixed["code"].isin(codes)]
 
-    st = get_strategy("regime_momentum")
-    r = engine.run(st, codes, eng_start, end,
-                   engine.BacktestConfig(initial_cash=200_000, max_positions=5), names)
+    # 两个策略都要测：
+    #   regime_momentum —— 常规策略，靠 exit() 离场
+    #   growth_value    —— 打分型策略（score_fields + exit() 恒 False），
+    #                      靠持有期上限调仓。这一类曾经在模拟盘里完全失效：
+    #                      score() 是占位符返回 0，候选全同分退化成按代码序买；
+    #                      又没有持有期概念，买满 5 只之后永远不动。两处都不报错。
+    cases = [
+        ("regime_momentum", {}, engine.BacktestConfig(
+            initial_cash=200_000, max_positions=5)),
+        ("growth_value", {}, engine.BacktestConfig(
+            initial_cash=200_000, max_positions=5, max_hold_days=5)),
+    ]
 
-    # 固定股票池，排除「模拟盘每日重建池子」这一设计差异
-    orig = uni_mod.build
-    saved = {k: paper._meta(k) for k in ("strategy", "params", "cash",
-                                         "initial_cash", "max_positions",
-                                         "top", "last_date", "created_at")}
-    uni_mod.build = lambda flt=None, as_of=None: fdf
+    snap = _paper_snapshot()
+    notes = []
     try:
-        paper.reset("regime_momentum", {}, 200_000, 5, 150)
-        for d in store.trading_days(start=start, end=end):
-            paper.advance(as_of=d, verbose=False)
-        with store.connect() as c:
-            pt = pd.read_sql("SELECT code,open_date,close_date,shares,pnl "
-                             "FROM paper_trade", c)
+        for name, params, cfg in cases:
+            et, pt = _paper_vs_engine(name, params, cfg, fdf, codes, names,
+                                      eng_start, start, end, 150)
+            if et.empty and pt.empty:
+                notes.append(f"{name} 区间内无交易")
+                continue
+            assert len(et) == len(pt),                 f"{name} 成交笔数不同：引擎 {len(et)}，模拟盘 {len(pt)}"
+            et = et.sort_values(["open_date", "code"]).reset_index(drop=True)
+            pt = pt.sort_values(["open_date", "code"]).reset_index(drop=True)
+            for col in ("code", "open_date", "close_date", "shares"):
+                assert (et[col].values == pt[col].values).all(),                     f"{name} {col} 不一致"
+            assert (abs(et["pnl"].values - pt["pnl"].values) < 0.05).all(),                 f"{name} 盈亏不一致"
+            notes.append(f"{name} {len(et)} 笔一致")
     finally:
-        uni_mod.build = orig
+        # 整表还原：自检绝不能把用户的前向记录冲掉
+        _paper_restore(snap)
+    return "；".join(notes)
 
-    et = pd.DataFrame([{"code": t.code, "open_date": t.open_date,
-                        "close_date": t.close_date, "shares": t.shares,
-                        "pnl": round(t.pnl, 2)} for t in r.trades])
-    if et.empty and pt.empty:
-        return "区间内无交易，无法比对"
-    assert len(et) == len(pt), f"成交笔数不同：引擎 {len(et)}，模拟盘 {len(pt)}"
-    et = et.sort_values(["open_date", "code"]).reset_index(drop=True)
-    pt = pt.sort_values(["open_date", "code"]).reset_index(drop=True)
-    for col in ("code", "open_date", "close_date", "shares"):
-        assert (et[col].values == pt[col].values).all(), f"{col} 不一致"
-    assert (abs(et["pnl"].values - pt["pnl"].values) < 0.05).all(), "盈亏不一致"
 
-    # 还原调用方原本的模拟盘配置，避免自检把用户的账户冲掉
-    if saved.get("strategy"):
-        import json as _json
-        paper.reset(saved["strategy"], _json.loads(saved["params"] or "{}"),
-                    float(saved["initial_cash"]), int(saved["max_positions"]),
-                    int(saved["top"]))
-    return f"{len(et)} 笔逐笔一致"
+@check("模拟盘：打分型策略的候选分数必须有区分度（不能全同分）")
+def _t_paper_score_spread():
+    """score_fields 类策略的 score() 是占位符，真正的合成在引擎和 paper 里各做一次。
+    漏掉任何一处都不会报错，只会让「按打分取前 N」静默变成「按代码序取前 N」。"""
+    from . import paper
+
+    st = get_strategy("growth_value")
+    fields = list(getattr(st, "score_fields", None) or [])
+    assert fields, "growth_value 应当声明 score_fields"
+
+    # 两个分量不能构造成完全反相关，否则百分位相加恒为常数——那是构造出来的
+    # 退化情形，验不出打分是否生效。用互质步长打散第二个分量。
+    sig = {f"{i:06d}": {"fields": {fields[0][0]: float(i),
+                                   fields[1][0]: float((i * 7) % 40)}}
+           for i in range(40)}
+    paper._apply_score_fields(sig, fields)
+    vals = sorted(v["score"] for v in sig.values())
+    assert len(set(round(v, 6) for v in vals)) > 1,         "候选分数全部相同——打分没有真正生效"
+    assert 0.0 <= vals[0] and vals[-1] <= 1.0,         f"归一后应落在 [0,1]，实际 {vals[0]:.3f}~{vals[-1]:.3f}"
+    return f"40 只候选得到 {len(set(round(v,6) for v in vals))} 个不同分数"
+
+
+@check("股票池：历史不足时必须报错，不能静默跳过流动性过滤")
+def _t_universe_loud():
+    """曾经 as_of 早于库内最早交易日时，build() 会静默返回全市场未过滤名单，
+    且未按成交额排序——「流动性前 N 只」实际取到的是代码序前 N 只。"""
+    days = store.trading_days()
+    if not days:
+        return "跳过：本地还没有数据"
+    too_early = (pd.Timestamp(days[0]) - pd.Timedelta(days=5)).strftime("%Y-%m-%d")
+    try:
+        uni = universe.build(as_of=too_early)
+    except universe.InsufficientHistory:
+        pass
+    else:
+        raise AssertionError(
+            f"as_of={too_early} 早于库内最早交易日 {days[0]}，"
+            f"却静默返回了 {len(uni)} 只，没有报错")
+
+    ok = universe.build(as_of=days[min(60, len(days) - 1)])
+    if ok.empty:
+        return "报错正常；正常区间池子为空（数据太少）"
+    amt = ok["avg_amount"]
+    assert amt.notna().all(), "正常区间的 avg_amount 不应为空"
+    assert (amt.diff().dropna() <= 1e-6).all(), "股票池必须按成交额降序排列"
+    return f"历史不足已报错；正常区间 {len(ok)} 只且按成交额降序"
 
 
 @check("数据：OHLC 逻辑自洽、主键无重复、无未来日期")

@@ -14,6 +14,29 @@ import pandas as pd
 from . import store
 
 
+MIN_LIQUIDITY_BARS = 15      # 算 20 日均成交额至少要有这么多根，与下方 bars 下限一致
+
+
+class InsufficientHistory(ValueError):
+    """as_of 之前的历史不足以衡量流动性——不能假装过滤过了。"""
+
+
+def _no_history_msg(as_of: str, have: int) -> str:
+    first = ""
+    with store.connect() as c:
+        r = c.execute("SELECT MIN(date) FROM daily").fetchone()
+        if r and r[0]:
+            first = f"本地库最早交易日是 {r[0]}，"
+    return (
+        f"as_of={as_of} 之前只有 {have} 个交易日，不足 {MIN_LIQUIDITY_BARS} 个，"
+        f"无法计算 20 日均成交额。{first}"
+        "请把起始日往后挪到至少有 20 个交易日历史的位置。"
+        "（这里曾经是静默返回全市场未过滤名单：不报错、条数看着还更多，"
+        "但流动性/价格过滤全被跳过，而且没有按成交额排序，"
+        "于是「流动性前 N 只」实际取到的是代码序前 N 只，"
+        "回测和因子评估的结论会整体失真。）")
+
+
 @dataclass
 class UniverseFilter:
     exclude_st: bool = True
@@ -69,14 +92,16 @@ def build(flt: UniverseFilter | None = None, as_of: str | None = None) -> pd.Dat
 
     # 流动性与价格用截止日前 20 个交易日的实际成交衡量
     days = store.trading_days(end=as_of)
-    if not days:
-        return inst.assign(avg_amount=pd.NA, last_close=pd.NA)
+    if len(days) < MIN_LIQUIDITY_BARS:
+        raise InsufficientHistory(_no_history_msg(as_of, len(days)))
     window_start = days[-min(20, len(days))]
 
     recent = store.load_daily(codes=inst["code"].tolist(),
                               start=window_start, end=as_of)
     if recent.empty:
-        return inst.assign(avg_amount=pd.NA, last_close=pd.NA)
+        raise InsufficientHistory(
+            f"as_of={as_of} 前 20 个交易日窗口内一条行情都没有，无法衡量流动性。"
+            "先跑 sync 补数据。")
 
     agg = recent.groupby("code").agg(
         avg_amount=("amount", "mean"),
