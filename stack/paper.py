@@ -273,13 +273,16 @@ def advance(as_of: str | None = None, verbose: bool = True) -> dict:
 
     # ---------------- 3. 盯市 ----------------
     mv = 0.0
+    updates = []
     for code, h in holds.items():
         c_px = px_at(code, as_of, "close") or h["cost"]
         h["peak"] = max(h["peak"], c_px)
         mv += h["shares"] * c_px
+        updates.append((h["peak"], h["hold_days"], code))
+    if updates:                      # 一次连接写完，而不是每只持仓开一次
         with store.connect() as conn:
-            conn.execute("UPDATE paper_holding SET peak=?, hold_days=? WHERE code=?",
-                         (h["peak"], h["hold_days"], code))
+            conn.executemany(
+                "UPDATE paper_holding SET peak=?, hold_days=? WHERE code=?", updates)
     equity = cash + mv
 
     bench = None

@@ -17,14 +17,27 @@ def ema(s: pd.Series, n: int) -> pd.Series:
 
 
 def rsi(s: pd.Series, n: int = 14) -> pd.Series:
-    delta = s.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    # diff/clip/fillna 都走 numpy：全市场扫描要按股票逐只调用，
+    # 每个 pandas 小操作 0.1-0.2ms 的固定开销乘以三千多只就很可观。
+    # ewm 保留 pandas 版（Wilder 平滑，自己写反而慢）。
+    v = np.asarray(s, dtype="float64")
+    d = np.empty_like(v)
+    d[0] = np.nan
+    d[1:] = v[1:] - v[:-1]
+    idx = s.index
     # Wilder 平滑
-    avg_gain = gain.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
-    avg_loss = loss.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return (100 - 100 / (1 + rs)).fillna(100 * (avg_gain > 0))
+    avg_gain = pd.Series(np.clip(d, 0.0, None), index=idx).ewm(
+        alpha=1 / n, adjust=False, min_periods=n).mean()
+    avg_loss = pd.Series(-np.clip(d, None, 0.0), index=idx).ewm(
+        alpha=1 / n, adjust=False, min_periods=n).mean()
+    ag, al = avg_gain.to_numpy(), avg_loss.to_numpy()
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = 100.0 - 100.0 / (1.0 + ag / np.where(al == 0, np.nan, al))
+    # 无涨跌（rs 为 NaN）或预热未满时：只涨记 100，其余记 0。
+    # 这是原实现 .fillna(100 * (avg_gain > 0)) 的语义，逐位对齐保留。
+    bad = np.isnan(out)
+    out[bad] = np.where(ag[bad] > 0, 100.0, 0.0)
+    return pd.Series(out, index=idx, name=s.name)
 
 
 def macd(s: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
@@ -35,13 +48,18 @@ def macd(s: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
 
 
 def atr(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+    # 三列拼成 DataFrame 再取行最大值，单只股票就要 0.47ms——全市场是 1.6s。
+    # np.fmax 与 DataFrame.max(axis=1) 的缺失值语义一致（忽略 NaN，全 NaN 才是 NaN），
+    # 首根 K 线没有前收，正好靠这一点退化成 high-low。
+    hi = np.asarray(high, dtype="float64")
+    lo = np.asarray(low, dtype="float64")
+    cl = np.asarray(close, dtype="float64")
+    prev = np.empty_like(cl)
+    prev[0] = np.nan
+    prev[1:] = cl[:-1]
+    tr = np.fmax(np.fmax(hi - lo, np.abs(hi - prev)), np.abs(lo - prev))
+    return pd.Series(tr, index=close.index).ewm(
+        alpha=1 / n, adjust=False, min_periods=n).mean()
 
 
 def bollinger(s: pd.Series, n: int = 20, k: float = 2.0):
@@ -97,27 +115,29 @@ def add_common(df: pd.DataFrame) -> pd.DataFrame:
     需要更多指标就在策略里覆写 prepare()，先 super().prepare(df) 再调 add_extended(df)
     或自己加列——只有真正用到的策略才付这份开销。
     """
-    df = df.copy()
     c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
 
-    for n in (5, 10, 20, 60, 120):
-        df[f"ma{n}"] = sma(c, n)
-    df["vol_ma20"] = sma(v, 20)
-    df["vol_ratio"] = v / df["vol_ma20"]
-
-    df["rsi14"] = rsi(c, 14)
-    df["atr14"] = atr(h, l, c, 14)
-    df["atr_pct"] = df["atr14"] / c
-
-    df["high20"] = rolling_high(h, 20)
-    df["low20"] = rolling_low(l, 20)
-    df["dd"] = drawdown(c)
-
-    df["mom20"] = momentum(c, 20)
-    df["mom60"] = momentum(c, 60)
-    df["mom120"] = momentum(c, 120)
-    df["vol20"] = volatility(c, 20)
-    return df
+    cols = {f"ma{n}": sma(c, n) for n in (5, 10, 20, 60, 120)}
+    vol_ma20 = sma(v, 20)
+    atr14 = atr(h, l, c, 14)
+    cols.update({
+        "vol_ma20": vol_ma20,
+        "vol_ratio": v / vol_ma20,
+        "rsi14": rsi(c, 14),
+        "atr14": atr14,
+        "atr_pct": atr14 / c,
+        "high20": rolling_high(h, 20),
+        "low20": rolling_low(l, 20),
+        "dd": drawdown(c),
+        "mom20": momentum(c, 20),
+        "mom60": momentum(c, 60),
+        "mom120": momentum(c, 120),
+        "vol20": volatility(c, 20),
+    })
+    # 一次拼接，而不是 18 次逐列赋值：每次 df[col] = ... 都要重建一遍块管理器，
+    # 单只股票看不出来，全市场两千多只乘 18 列就很可观。
+    # 这里返回的是新对象，调用方的 df 不受影响（原先靠 df.copy() 保证，同样成立）。
+    return pd.concat([df, pd.DataFrame(cols, index=df.index)], axis=1)
 
 
 def add_extended(df: pd.DataFrame) -> pd.DataFrame:

@@ -135,6 +135,7 @@ def sync(start_year: int = 2017, progress=None, sleep: float = 0.8) -> dict:
                     f"VALUES ({','.join('?' * len(cols))})", store._rows(df))
             stats["ok"] += 1
             stats["rows"] += len(df)
+            clear_cache()
         if progress:
             progress(i, len(ps), stats)
         time.sleep(sleep)
@@ -157,28 +158,72 @@ def load_pit(codes: list[str] | None = None,
         return pd.read_sql(sql, c, params=params)
 
 
+# ------------------------------------------------------------------ 缓存
+# as_panel 是**逐股**调用的：策略的 prepare() 只拿得到单只股票的 df，
+# 于是全市场扫一遍就是「股票数 × 字段数」次调用。原先每次都重查一遍库、
+# 重做一次 pivot、再对 600 个交易日做一次二维 ffill——实测模拟盘推进一个交易日、
+# 150 只股票、2 个字段 = 300 次调用，光 as_panel 就占掉单日耗时的一半以上。
+#
+# 基本面是季频的：整张宽表只有几十行（每个法定披露截止日一行）。
+# 所以把「读库 + pivot + 沿披露日 ffill」全部收进按字段缓存的一步，
+# 逐股调用时只剩「取一列 + 按日期二分查找」，与日期序列长度线性相关。
+_PIT_LONG: pd.DataFrame | None = None
+_PIT_WIDE: dict[str, pd.DataFrame] = {}
+
+
+def clear_cache() -> None:
+    """基本面表被写过之后必须调用，否则同进程内读到的还是旧数据。"""
+    global _PIT_LONG
+    _PIT_LONG = None
+    _PIT_WIDE.clear()
+
+
+def _pit_long() -> pd.DataFrame:
+    global _PIT_LONG
+    if _PIT_LONG is None:
+        _PIT_LONG = load_pit()
+    return _PIT_LONG
+
+
+def _pit_wide(field: str) -> pd.DataFrame:
+    """某字段的 (法定披露截止日 × 全部股票) 宽表，已沿披露日 ffill。整进程只算一次。
+
+    ffill 必须在这里做，不能留到按交易日 reindex 的时候：某一期缺某只股票时，
+    宽表那一格是 NaN，而 reindex(method="ffill") 是按**行位置**取值的，
+    取到那一行就得到 NaN，不会再往上找。先把宽表本身补齐才是对的。
+    """
+    w = _PIT_WIDE.get(field)
+    if w is None:
+        fd = _pit_long()
+        if fd.empty or field not in fd.columns:
+            w = pd.DataFrame()
+        else:
+            f = fd[["code", "period", "avail_date", field]].dropna(subset=[field])
+            # 年报(1231)与次年一季报(0331)的法定截止日**都是 4-30**，会撞在同一天。
+            # 撞车时必须取更新的那期（一季报），所以先按 period 升序，再用 last。
+            f = f.sort_values(["code", "avail_date", "period"])
+            w = f.pivot_table(index="avail_date", columns="code", values=field,
+                              aggfunc="last", sort=True).ffill()
+        _PIT_WIDE[field] = w
+    return w
+
+
 def as_panel(field: str, dates: list[str],
              codes: list[str]) -> pd.DataFrame:
     """把某个基本面字段展开成 point-in-time 宽表（日期 × 股票）。
 
-    每个交易日取**该日之前已过披露截止日**的最新一期数据，用 ffill 实现。
+    每个交易日取**该日之前已过披露截止日**的最新一期数据。
     这样 2025-01-15 这天看到的仍是 2024 年三季报，直到 2025-04-30 才切到年报——
     与真实世界的信息可得性一致。
     """
-    fd = load_pit(codes)
-    if fd.empty or field not in fd.columns:
-        return pd.DataFrame(index=pd.Index(dates, name="date"), columns=codes,
-                            dtype="float32")
-    fd = fd[["code", "period", "avail_date", field]].dropna(subset=[field])
-    # 年报(1231)与次年一季报(0331)的法定截止日**都是 4-30**，会撞在同一天。
-    # 撞车时必须取更新的那期（一季报），所以先按 period 升序，再用 last。
-    fd = fd.sort_values(["code", "avail_date", "period"])
-    wide = (fd.pivot_table(index="avail_date", columns="code", values=field,
-                           aggfunc="last", sort=True)
-              .reindex(columns=codes))
-    idx = pd.Index(sorted(set(dates) | set(wide.index)), name="date")
-    wide = wide.reindex(idx).ffill().reindex(pd.Index(dates, name="date"))
-    return wide.astype("float32")
+    wide = _pit_wide(field)
+    idx = pd.Index(dates, name="date")
+    if wide.empty:
+        return pd.DataFrame(index=idx, columns=codes, dtype="float32")
+    # 先取列再对齐日期：逐股调用时这里只有一列，代价与股票数无关。
+    # method="ffill" 走的是二分查找，不会像二维 ffill 那样铺满整个日期 × 股票矩阵。
+    sub = wide.reindex(columns=codes)
+    return sub.reindex(idx, method="ffill").astype("float32")
 
 
 def coverage() -> dict:
