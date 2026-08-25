@@ -123,6 +123,52 @@ def _t_strategies():
     return f"{len(infos)} 个策略"
 
 
+@check("策略：声明了精简指标集的，信号必须与全量指标下完全一致")
+def _t_indicator_subset():
+    """Strategy.indicators 声明少了不会报错——entry() 里的 KeyError 会被
+    引擎/模拟盘/信号三处的 `except Exception: continue` 吞掉，该股票被静默跳过，
+    表现为"策略不出信号"。这里直接调用，不给它被吞掉的机会。"""
+    days = store.trading_days()
+    if len(days) < 300:
+        return "跳过：交易日不足"
+    uni = universe.build(as_of=days[-1])
+    if uni.empty:
+        return "跳过：股票池为空"
+    raw = store.load_daily(uni["code"].tolist()[:30], start=days[-400])
+
+    checked = []
+    for info in all_strategies():
+        name = info["name"]
+        s_min = get_strategy(name)
+        decl = getattr(s_min, "indicators", None)
+        if decl is None:
+            continue
+        unknown = set(decl) - set(ind.COMMON_COLUMNS)
+        assert not unknown, f"{name} 声明了不存在的指标列 {sorted(unknown)}"
+
+        s_full = get_strategy(name)
+        s_full.indicators = None          # 实例级覆盖，退回全量指标
+        n = 0
+        for code, g in raw.groupby("code", sort=False):
+            g = store.usable_history(g.sort_values("date"))
+            if len(g) < 130:
+                continue
+            a, b = s_min.prepare(g), s_full.prepare(g)
+            for fn in ("entry", "exit", "score"):
+                x = np.asarray(getattr(s_min, fn)(a), dtype="float64")
+                y = np.asarray(getattr(s_full, fn)(b), dtype="float64")
+                assert x.shape == y.shape, f"{name}.{fn} 长度不同"
+                assert np.allclose(x, y, equal_nan=True), (
+                    f"{name}.{fn} 在精简指标集下与全量指标不一致——"
+                    f"声明的 {sorted(decl)} 不够用")
+            n += 1
+        assert n >= 5, f"{name} 只比对到 {n} 只，样本太少，说明不了问题"
+        checked.append(f"{name} {len(decl)}/{len(ind.COMMON_COLUMNS)} 列 × {n} 只")
+    if not checked:
+        return "没有策略声明精简指标集"
+    return "；".join(checked)
+
+
 # ------------------------------------------------------------------ 回测引擎
 def _sample(n=250, start="2022-01-01"):
     """取一小撮真实数据用于引擎检查；数据不足时返回 None 让检查跳过。"""

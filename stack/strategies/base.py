@@ -37,6 +37,15 @@ class Strategy:
     # 可选：给界面用的参数说明 {参数名: {label, min, max, step, options, hint}}
     param_meta: dict = field(default_factory=dict)
 
+    # 需要哪些通用指标列（见 indicators.COMMON_COLUMNS）。None = 全部，默认。
+    # 全市场扫描要对每只股票跑一遍 add_common，只算用得到的那几列能省掉大半。
+    #
+    # ⚠ 声明少了不会报错：entry() 里那次 KeyError 会被引擎/模拟盘/信号三处的
+    #   `except Exception: continue` 吞掉，该股票被静默跳过，表现为"策略不出信号"。
+    #   自检里有一项专门比对「精简集 vs 全量」下的 entry/exit/score 是否完全一致，
+    #   改了这个声明就去把那项跑一遍。
+    indicators: tuple[str, ...] | None = None
+
     def __init__(self, **params):
         merged = {**self.defaults}
         for k, v in params.items():
@@ -88,7 +97,7 @@ class Strategy:
 
     def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
         """补指标列。默认加通用指标；策略需要特殊指标时覆写并调用 super()。"""
-        return ind.add_common(df)
+        return ind.add_common(df, self.indicators)
 
     def entry(self, df: pd.DataFrame) -> pd.Series:
         raise NotImplementedError

@@ -14,6 +14,7 @@ from datetime import datetime
 
 import pandas as pd
 
+from . import indicators as ind
 from .config import LOT_SIZE
 from .data import source, store, universe
 from .strategies import base as base_mod
@@ -49,6 +50,34 @@ def _latest_usable_date(allow_partial: bool = False) -> tuple[str | None, bool]:
     if complete and complete != last:
         return complete, True
     return last, False
+
+
+# 界面上展示的四列指标，不参与选股
+_DISPLAY = (("ma20", 2), ("rsi14", 1), ("vol_ratio", 2), ("atr_pct", 4))
+
+
+def _fill_display_indicators(buys: list[dict], raw: pd.DataFrame) -> None:
+    """给最终入选的候选补上展示用指标。
+
+    策略可以声明只算自己用得到的指标（Strategy.indicators），growth_value 就
+    一个技术指标都不算。但界面那张表要显示 MA20/RSI/量比/ATR%——缺了会变成
+    一排空白，看起来像数据有问题。这里只对最终的十来只重算一遍，代价可忽略，
+    而且**不会**因此影响选股：这四列从来不参与排序。
+    """
+    todo = [b for b in buys if any(k not in b["_row"].index for k, _ in _DISPLAY)]
+    full = {}
+    if todo:
+        want = [k for k, _ in _DISPLAY]
+        sub = raw[raw["code"].isin([b["code"] for b in todo])]
+        for code, g in sub.groupby("code", sort=False):
+            g = store.usable_history(g.sort_values("date"))
+            if len(g):
+                full[code] = ind.add_common(g, want).iloc[-1]
+    for b in buys:
+        r = full.get(b["code"], b["_row"])
+        for key, nd in _DISPLAY:
+            v = r.get(key, float("nan"))
+            b[key] = round(float(v), nd)
 
 
 def generate(strategy: Strategy, flt: universe.UniverseFilter | None = None,
@@ -112,10 +141,6 @@ def generate(strategy: Strategy, flt: universe.UniverseFilter | None = None,
                     "score": float(strategy.score(d).iloc[-1]),
                     "reason": strategy.reason(row, "BUY"),
                     "_row": row,
-                    "ma20": round(float(row.get("ma20", float("nan"))), 2),
-                    "rsi14": round(float(row.get("rsi14", float("nan"))), 1),
-                    "vol_ratio": round(float(row.get("vol_ratio", float("nan"))), 2),
-                    "atr_pct": round(float(row.get("atr_pct", float("nan"))), 4),
                 })
             if code in held_codes and bool(strategy.exit(d).iloc[-1]):
                 sells.append({
@@ -135,11 +160,11 @@ def generate(strategy: Strategy, flt: universe.UniverseFilter | None = None,
         scores = blend_score_fields(vals, score_fields)
         for b in buys:
             b["score"] = scores.get(b["code"], 0.0)
-    for b in buys:
-        b.pop("_row", None)
-
     buys.sort(key=lambda x: -x["score"])
     buys = buys[: cfg.max_candidates]
+    _fill_display_indicators(buys, raw)
+    for b in buys:
+        b.pop("_row", None)
 
     # 给出参考手数，省得自己按计算器
     budget = cfg.portfolio_value / max(cfg.max_positions, 1)

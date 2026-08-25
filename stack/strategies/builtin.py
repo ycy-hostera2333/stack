@@ -459,6 +459,9 @@ class GrowthValue(Strategy):
     # 两个分量交给引擎做横截面百分位归一后等权相加。
     # 不能在 score() 里自己 rank——那排的是时间维度，还会用到未来数据。
     score_fields = [("f_rev_yoy", 1.0), ("f_bp", 1.0)]
+    # 本策略完全不看技术指标：entry 只查两个基本面字段是否可用，exit 恒为 False。
+    # 空元组让 add_common 一列都不算——全市场扫描省掉三千多次指标计算。
+    indicators: tuple[str, ...] = ()
     defaults = {
         "index_ma": 0,            # 大盘择时，0=关闭（实测只降回撤不提收益）
         "w_growth": 1.0,          # 权重：营收增长

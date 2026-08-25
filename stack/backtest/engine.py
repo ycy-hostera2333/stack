@@ -160,7 +160,11 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
         row["open"][pos] = d["open"].to_numpy()[sel]
         row["high"][pos] = d["high"].to_numpy()[sel]
         row["close"][pos] = d["close"].to_numpy()[sel]
-        row["atr"][pos] = d["atr14"].to_numpy()[sel]
+        # 策略可以声明不需要 atr14（见 Strategy.indicators）。这里留 NaN，
+        # 由 run() 在开跑前挡住"要用跟踪止损却没有 ATR"的组合——
+        # 引擎对 NaN 的 ATR 是静默跳过的，不挡就会看起来生效、实际一次都不触发。
+        if "atr14" in d.columns:
+            row["atr"][pos] = d["atr14"].to_numpy()[sel]
         row["score"][pos] = score[sel]
 
         for name in score_cols:
@@ -260,6 +264,16 @@ def run(strategy: Strategy, codes: list[str], start: str, end: str,
         strategy=strategy.name, params=strategy.params,
         config=asdict(cfg), start=start, end=end,
     )
+    if cfg.trail_stop_atr > 0:
+        need = getattr(strategy, "indicators", None)
+        if need is not None and "atr14" not in need:
+            raise ValueError(
+                f"策略 {strategy.name} 声明了不需要 atr14，无法启用跟踪止损"
+                f"（trail_stop_atr={cfg.trail_stop_atr}）。"
+                "引擎遇到 NaN 的 ATR 会直接跳过判断——不拦住的话，"
+                "跟踪止损在界面上是开着的，实际一次都不会触发。"
+                "要么关掉跟踪止损，要么把 atr14 加进该策略的 indicators。")
+
     dates = store.trading_days(start=start, end=end)
     if len(dates) < 2:
         result.metrics = {"error": "交易日不足，无法回测"}
