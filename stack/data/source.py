@@ -5,6 +5,7 @@ akshare 是爬虫聚合库，接口列名会随上游改动，所以这里全部
 """
 from __future__ import annotations
 
+import os
 import random
 import threading
 import time
@@ -95,6 +96,35 @@ RETRY_SLEEP = 1.0        # 退避基数，实际为 RETRY_SLEEP * 2^n + 抖动
 
 # 增量同步时往回重抓的天数，用于覆盖盘中写入的残缺 K 线
 OVERLAP_DAYS = 7
+
+def _disable_proxy() -> None:
+    """本进程内禁用 HTTP 代理。
+
+    腾讯、新浪、东财全是国内站点，走代理没有任何好处，坏处有三个：
+
+    1. **慢**。实测抓同一批股票，走代理 1.9s/只，直连 0.6s/只——慢 3.2 倍。
+    2. **更容易被限流**。请求从代理的共享出口 IP 发出，上游看到的是同一个 IP
+       打来的海量请求。之前一直归因于"上游限流"的那些成块失败，很大一部分
+       其实是这么来的。
+    3. **代理一关就全挂**。表现是每只股票都 ProxyError，界面上显示成
+       「四个源全部失败」，看着像数据源集体下线，实际是本地代理没开：
+       Unable to connect to proxy / WinError 10061 目标计算机积极拒绝。
+
+    只改本进程的环境变量，不碰系统代理设置，也不影响其他程序。
+    真要走代理（比如将来接了境外源）就设 STACK_USE_PROXY=1。
+    """
+    if os.environ.get("STACK_USE_PROXY") == "1":
+        return
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "all_proxy"):
+        os.environ.pop(var, None)
+    # requests 和 urllib 都认这个通配，等于「所有主机都直连」
+    os.environ["NO_PROXY"] = "*"
+    os.environ["no_proxy"] = "*"
+
+
+_disable_proxy()
+
 
 # 一轮里连续失败到这个程度，就判定为被限流并立刻中止本轮。
 # 实测过一次：前 343 只全成功，之后 4491 只**全部**失败，而三轮扫完仍然

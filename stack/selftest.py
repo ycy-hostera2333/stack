@@ -562,6 +562,59 @@ def _t_backtest_tail():
             f"含 {n_tail} 个残日的区间已告警")
 
 
+@check("模拟盘：catch_up 必须逐日推进，不能跳过中间交易日")
+def _t_catch_up_daily():
+    """前向记录的价值在于逐日连续，中间缺几天就不再是「每天做了什么决策」的账。
+
+    这里曾经是循环调用 advance()（不带 as_of），结果只推进一天就停：
+    advance 省略 as_of 时直接取最后一个完整交易日，第一次就跳到最新那天并把
+    last_date 设成它，第二次立刻被「已处理过」的守卫挡掉。中间交易日整段消失，
+    而 last_date 照样显示「已追平到最新交易日」——从外面一点都看不出来。
+    实测踩过：账户落后 5 个交易日，跑完只推进 1 天。
+    """
+    from . import paper
+
+    complete = store.last_complete_day()
+    assert complete, "last_complete_day 不该为空"
+    days = store.trading_days(end=complete)
+    if len(days) < 10:
+        return "跳过：交易日不足"
+
+    acct = "__selftest_catchup__"
+    back = days[-5]                      # 制造「落后 4 个交易日」
+    want = [d for d in days if d > back]
+    try:
+        paper.reset("ma_cross", {}, 100_000, 3, 40, 0, account=acct)
+        paper._set("last_date", back, account=acct)
+        assert paper.lag_days(acct) == len(want), (
+            f"lag_days 说落后 {paper.lag_days(acct)} 天，实际应为 {len(want)}")
+
+        n = paper.catch_up(verbose=False, account=acct)
+        assert n == len(want), (
+            f"落后 {len(want)} 个交易日，catch_up 只推进了 {n} 个")
+
+        with store.connect() as c:
+            got = [r[0] for r in c.execute(
+                "SELECT date FROM paper_equity WHERE account=? ORDER BY date",
+                (acct,)).fetchall()]
+        assert got == want, f"净值记录有空洞：期望 {want}，实际 {got}"
+        assert paper.lag_days(acct) == 0, "推完之后不该还落后"
+
+        # 新账户（从未推进过）只处理最新那天，不回补历史
+        fresh = "__selftest_fresh__"
+        try:
+            paper.reset("ma_cross", {}, 100_000, 3, 40, 0, account=fresh)
+            assert paper.lag_days(fresh) == 0, (
+                "新账户不该显示成落后——它从建立之后才开始记")
+            m = paper.catch_up(verbose=False, account=fresh)
+            assert m == 1, f"新账户应只推进最新一天，实际推进 {m} 天"
+        finally:
+            paper.drop_account(fresh)
+    finally:
+        paper.drop_account(acct)
+    return f"落后 {len(want)} 天逐日补齐无空洞；新账户只推进 1 天"
+
+
 @check("打分：打分型策略在模拟盘与每日信号里都必须真正打分")
 def _t_score_spread():
     """score_fields 类策略的 score() 是占位符，真正的横截面合成要在

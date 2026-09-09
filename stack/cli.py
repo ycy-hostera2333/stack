@@ -439,7 +439,21 @@ def main(argv=None) -> int:
     v.set_defaults(func=cmd_serve)
 
     args = p.parse_args(argv)
-    args.func(args)
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        # 同步、回补都是增量的，中断不留半截状态：已写入的行都在，
+        # 重跑会接着补没取到的部分。
+        #
+        # 之所以要吞掉 traceback：Windows 上中断多线程抓取时，Python 往
+        # signal wakeup fd 写数据会连带甩出「WinError 10038 在一个非套接字上
+        # 尝试了一个操作」——requests 频繁开关 socket 让 fd 号被复用，属于
+        # 环境噪音，它前面还印着 Exception ignored，其实什么都没坏。
+        # 但一屏 traceback 看着像崩了，会让人不敢重跑。
+        print(file=sys.stderr)
+        print("已中断。已写入的数据都在，重跑会接着补没取到的部分。",
+              file=sys.stderr)
+        return 130
     return 0
 
 

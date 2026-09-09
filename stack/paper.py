@@ -435,12 +435,34 @@ def advance(as_of: str | None = None, verbose: bool = True,
 
 def catch_up(max_days: int = 400, verbose: bool = True,
              account: str = DEFAULT_ACCOUNT) -> int:
-    """从上次处理到的地方一路推进到最新已收盘交易日。"""
+    """从上次处理到的地方**逐日**推进到最新已收盘交易日。
+
+    必须自己列出日期一天天走。这里曾经是循环调用 advance()（不带 as_of），
+    结果只推进一天就停：advance 省略 as_of 时直接取最后一个完整交易日，
+    第一次就跳到最新那天并把 last_date 设成它，第二次立刻被「已处理过」
+    的守卫挡掉，循环结束。
+
+    中间那些交易日被整段跳过，前向记录留下空洞——而 last_date 照样显示
+    「已追平到最新交易日」，从外面一点都看不出来。实测踩过：账户落后 5 个
+    交易日，跑完只推进了 1 天，09-02 到 09-07 全没了。
+    """
+    _init()
+    complete = store.last_complete_day()
+    if not complete:
+        return 0
+
+    last = _meta("last_date", "", account=account)
+    if last:
+        pending = [d for d in store.trading_days(end=complete) if d > last]
+    else:
+        # 新账户从建立之后才开始记，不回补历史，只处理最新那天
+        pending = [complete]
+
     n = 0
-    for _ in range(max_days):
-        ev = advance(account=account)
+    for d in pending[:max_days]:
+        ev = advance(as_of=d, verbose=False, account=account)
         if ev.get("skipped"):
-            break
+            continue
         n += 1
         if verbose and (ev["buys"] or ev["sells"]):
             print(f"  {ev['date']}  买{len(ev['buys'])} 卖{len(ev['sells'])}  "
@@ -458,9 +480,13 @@ def lag_days(account: str = DEFAULT_ACCOUNT) -> int:
     complete = store.last_complete_day()
     if not complete:
         return 0
-    days = store.trading_days(end=complete)
     if not last:
-        return len(days)
+        # 新建但一次都没推进过的账户：它从建立之后才开始记，不需要追历史。
+        # 这里曾经返回 len(days)，于是界面上显示「模拟盘落后 2108 个交易日」，
+        # 看着像坏了——而实际上 catch_up 只会推进一天（advance 在 as_of 省略时
+        # 直接取最后一个完整交易日）。落后 0 天才是实情。
+        return 0
+    days = store.trading_days(end=complete)
     return len([d for d in days if d > last])
 
 
