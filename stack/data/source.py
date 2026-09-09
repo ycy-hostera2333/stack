@@ -32,6 +32,26 @@ CIRCUIT_THRESHOLD = 3      # 连续失败达到此数才熔断（1 太敏感，�
 CIRCUIT_COOLDOWN = 60.0    # 冷却秒数，过后放行一次试探
 
 
+def _empty_ok() -> pd.DataFrame:
+    """源正常应答了，只是这只股票在该区间没有数据（退市、长期停牌、次新）。
+
+    和「源故障」必须分开：只有后者该计入熔断。两者的代价极不对称——
+    把股票问题误判成源故障，会熔断整个源、拖垮之后几千只健康股票（实测零成功）；
+    反过来最多只是少记一次账，下一只股票照样会去试。
+    """
+    df = pd.DataFrame()
+    df.attrs["source_ok"] = True
+    return df
+
+
+def _source_ok(df: pd.DataFrame) -> bool:
+    """这张空表是「源正常但无数据」，还是「源故障」。"""
+    try:
+        return bool(df.attrs.get("source_ok"))
+    except Exception:
+        return False
+
+
 def _circuit_open(src: str) -> bool:
     """该源当前是否应跳过。冷却期已过则放行试探。"""
     with _circuit_lock:
@@ -75,6 +95,29 @@ RETRY_SLEEP = 1.0        # 退避基数，实际为 RETRY_SLEEP * 2^n + 抖动
 
 # 增量同步时往回重抓的天数，用于覆盖盘中写入的残缺 K 线
 OVERLAP_DAYS = 7
+
+# 一轮里连续失败到这个程度，就判定为被限流并立刻中止本轮。
+# 实测过一次：前 343 只全成功，之后 4491 只**全部**失败，而三轮扫完仍然
+# 老老实实打完了 13816 次请求——8 分钟全废，还把限流拖得更久。
+#
+# 次数和时间必须同时满足，缺一不可：
+#   只看次数会和熔断打架。四个源同时进冷却期时所有请求都返回空，而冷却是
+#   CIRCUIT_COOLDOWN 秒——慢速档 2.5 只/秒，60 秒就失败 150 只，比任何合理的
+#   次数阈值都大。实测就踩过：ABORT_STREAK=120 在第 48 秒中止整轮，
+#   比熔断自己恢复还早，4834 只全判失败，可同一时刻手动请求是成功的。
+#   只看时间则会在并发很低时反应迟钝。
+ABORT_STREAK = 120
+ABORT_SECONDS = CIRCUIT_COOLDOWN * 2.5
+
+# 轮间冷却。原本是 60/120 秒，太短——限流通常要几分钟到十几分钟才解除，
+# 冷却不够就是拿新一轮失败去续上一轮的限流。
+RETRY_PASSES = ((MAX_WORKERS, 0), (3, 240), (2, 600))
+
+# 慢速档：已经被限流、要把缺口补回来时用（CLI 的 --slow）。
+# 常规档是 5 线程 × 0.15s ≈ 33 请求/秒，几百只就打满了上游的速率限制；
+# 这一档约 2.5 请求/秒，慢十倍，但一次跑完好过重跑十几次。
+SLOW_WORKERS = 2
+SLOW_GAP = 0.8
 
 # BaoStock 默认关闭：它的前复权序列与腾讯/akshare **不兼容**。
 #
@@ -196,7 +239,7 @@ def _fetch_akshare(code: str, start: str, end: str, adjust: str) -> pd.DataFrame
                 start_date=start, end_date=end, adjust=adjust,
             )
             if raw is None or raw.empty:
-                return pd.DataFrame()
+                return _empty_ok()
             df = raw.rename(columns=_HIST_COLS)
             keep = ["date", "open", "high", "low", "close",
                     "volume", "amount", "pct_chg", "turnover"]
@@ -236,10 +279,14 @@ def _fetch_tencent(code: str, start: str, end: str,
             break
         cur = seg_start - pd.Timedelta(days=1)
 
-    parts = [_fetch_tencent_span(code, a, b, adjust) for a, b in spans]
+    raw_parts = [_fetch_tencent_span(code, a, b, adjust) for a, b in spans]
+    # 每段都「正常应答但没数据」→ 这只股票就是没数据，不是源挂了
+    all_ok = bool(raw_parts) and all(_source_ok(p) or (p is not None and not p.empty)
+                                     for p in raw_parts)
+    parts = raw_parts
     parts = [p for p in parts if p is not None and not p.empty]
     if not parts:
-        return pd.DataFrame()
+        return _empty_ok() if all_ok else pd.DataFrame()
     out = (pd.concat(parts, ignore_index=True)
              .drop_duplicates(subset=["date"])
              .sort_values("date").reset_index(drop=True))
@@ -279,17 +326,20 @@ def _fetch_tencent_span(code: str, start: str, end: str,
                 raw = resp.read().decode("utf-8")
             data = json.loads(raw)
             stock_data = data.get("data", {})
+            # 下面三处「拿不到 K 线」都是源正常应答的结果，不是源故障：
+            # JSON 都解析出来了，说明接口是活的，只是没有这只股票的数据。
+            # 退市股最典型——返回里有 day 字段却没有 qfqday（没有前复权序列）。
             if not stock_data:
-                return pd.DataFrame()
+                return _empty_ok()
             stock_key = next(iter(stock_data), None)
             if not stock_key:
-                return pd.DataFrame()
+                return _empty_ok()
             # 前复权时优先取 qfqday，否则取 day
             klines = (stock_data[stock_key].get("qfqday")
                       if adjust in ("qfq", "q")
                       else stock_data[stock_key].get("day"))
             if not klines:
-                return pd.DataFrame()
+                return _empty_ok()
             rows = []
             for k in klines:
                 if len(k) >= 6:
@@ -302,7 +352,7 @@ def _fetch_tencent_span(code: str, start: str, end: str,
                         "volume": float(k[5]),
                     })
             if not rows:
-                return pd.DataFrame()
+                return _empty_ok()
             df = pd.DataFrame(rows)
             df["code"] = code
             df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
@@ -331,8 +381,9 @@ def _fetch_tencent_span(code: str, start: str, end: str,
     return pd.DataFrame()
 
 
-def _fetch_baostock(code: str, start: str, end: str, adjust: str = "qfq") -> pd.DataFrame:
-    """BaoStock 数据源：单只股票日线。
+def _fetch_baostock_unlocked(code: str, start: str, end: str,
+                             adjust: str = "qfq") -> pd.DataFrame:
+    """BaoStock 数据源：单只股票日线。**不要直接调用**，走 _fetch_baostock。
 
     移植自 Vibe-Trading 的 baostock_loader：走 TCP 协议，绕开 HTTP 数据源
     （东财/腾讯）的 CDN 封禁。免费、无需 token。返回与 akshare 相同的列结构。
@@ -367,6 +418,7 @@ def _fetch_baostock(code: str, start: str, end: str, adjust: str = "qfq") -> pd.
                 if rs.error_code != "0":
                     return pd.DataFrame()
                 rows = []
+                _bs_answered = True
                 while rs.next():
                     rows.append(rs.get_row_data())
                 if not rows:
@@ -387,6 +439,23 @@ def _fetch_baostock(code: str, start: str, end: str, adjust: str = "qfq") -> pd.
                 return pd.DataFrame()
             time.sleep(RETRY_SLEEP * (2 ** attempt) * (0.5 + random.random()))
     return pd.DataFrame()
+
+
+# baostock 用一份全局登录态和一条 TCP 连接，**不是线程安全的**：两个线程同时
+# 调它会互相踩坏 socket。实测 2 线程并发抓 4 只，报
+# 「[WinError 10038] 在一个非套接字上尝试了一个操作」，其中一只直接拿不到数据。
+#
+# 平时被 fetch_daily 的 fallback 掩盖着（腾讯成功就轮不到它），可偏偏腾讯被限流
+# 时最需要它顶上，而那正是并发全压到它身上的时刻——最需要备胎的时候备胎是坏的。
+# 它本来就是备胎，串行化损失不大：一个可靠的备胎胜过一个并发下会坏的。
+_baostock_lock = threading.Lock()
+
+
+def _fetch_baostock(code: str, start: str, end: str,
+                    adjust: str = "qfq") -> pd.DataFrame:
+    """_fetch_baostock_unlocked 的串行化包装。理由见上面 _baostock_lock。"""
+    with _baostock_lock:
+        return _fetch_baostock_unlocked(code, start, end, adjust)
 
 
 def _to_tushare_code(code: str) -> str:
@@ -461,7 +530,13 @@ def fetch_daily(code: str, start: str = HISTORY_START, end: str | None = None,
             if on_event:
                 on_event("tencent", len(df))
             return df
-        _circuit_fail("tencent")
+        # 空表分两种：源正常应答但这只股票没数据（退市/长期停牌/次新），
+        # 和源真的挂了。只有后者该记熔断——否则几只僵尸股就能把源判死，
+        # 之后几千只健康股票全被跳过，而且一条错都不报。
+        if _source_ok(df):
+            _circuit_reset("tencent")
+        else:
+            _circuit_fail("tencent")
 
     # 2) BaoStock —— **默认不启用**，见 USE_BAOSTOCK 的说明
     if USE_BAOSTOCK and not _circuit_open("baostock"):
@@ -471,7 +546,13 @@ def fetch_daily(code: str, start: str = HISTORY_START, end: str | None = None,
             if on_event:
                 on_event("baostock", len(df))
             return df
-        _circuit_fail("baostock")
+        # 空表分两种：源正常应答但这只股票没数据（退市/长期停牌/次新），
+        # 和源真的挂了。只有后者该记熔断——否则几只僵尸股就能把源判死，
+        # 之后几千只健康股票全被跳过，而且一条错都不报。
+        if _source_ok(df):
+            _circuit_reset("baostock")
+        else:
+            _circuit_fail("baostock")
 
     # 3) Tushare Pro（需要 token，退市股专用也能兜底）
     if not _circuit_open("tushare"):
@@ -481,7 +562,13 @@ def fetch_daily(code: str, start: str = HISTORY_START, end: str | None = None,
             if on_event:
                 on_event("tushare", len(df))
             return df
-        _circuit_fail("tushare")
+        # 空表分两种：源正常应答但这只股票没数据（退市/长期停牌/次新），
+        # 和源真的挂了。只有后者该记熔断——否则几只僵尸股就能把源判死，
+        # 之后几千只健康股票全被跳过，而且一条错都不报。
+        if _source_ok(df):
+            _circuit_reset("tushare")
+        else:
+            _circuit_fail("tushare")
 
     # 4) akshare（东财，最全字段但慢）
     if not _circuit_open("akshare"):
@@ -491,7 +578,13 @@ def fetch_daily(code: str, start: str = HISTORY_START, end: str | None = None,
             if on_event:
                 on_event("akshare", len(df))
             return df
-        _circuit_fail("akshare")
+        # 空表分两种：源正常应答但这只股票没数据（退市/长期停牌/次新），
+        # 和源真的挂了。只有后者该记熔断——否则几只僵尸股就能把源判死，
+        # 之后几千只健康股票全被跳过，而且一条错都不报。
+        if _source_ok(df):
+            _circuit_reset("akshare")
+        else:
+            _circuit_fail("akshare")
 
     # 全部失败：记录原因
     if on_event:
@@ -509,11 +602,11 @@ def market_closed_today() -> bool:
     return now.hour * 60 + now.minute >= 15 * 60 + 5
 
 
-def sync_daily(codes: list[str] | None = None, full: bool = False,
-               progress=None, overlap_days: int = OVERLAP_DAYS,
-               only_missing: bool = False, on_event=None,
-               circuit_breaker: int = CIRCUIT_THRESHOLD,
-               cancel_check=None) -> dict:
+def _sync_daily_impl(codes: list[str] | None = None, full: bool = False,
+                     progress=None, overlap_days: int = OVERLAP_DAYS,
+                     only_missing: bool = False, on_event=None,
+                     circuit_breaker: int = CIRCUIT_THRESHOLD,
+                     cancel_check=None, slow: bool = False) -> dict:
     """增量同步日线。
 
     增量更新不是从"本地最后日期 + 1 天"开始，而是**往回退 overlap_days 天重新抓**，
@@ -542,7 +635,21 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
         inst = store.load_instruments()
 
     if codes is None:
-        codes = inst["code"].tolist()
+        # 日常同步排除已退市股：免费源根本没有它们的行情（实测三个源对 367 只
+        # 退市股全部取不到），每只还要把四个源挨个试一遍才失败。
+        #
+        # 危害不止是白费请求。熔断分不清「源挂了」和「这只股票本来就没数据」，
+        # 连续几只退市股就能把四个源全判成熔断，之后所有请求被直接跳过——
+        # 4595 只健康股票被 239 只僵尸股拖死，而且一条错都不报。
+        # 实测正是这么炸的：加了「落后最多的优先」排序后，退市股因为最旧
+        # 全排到了队首，第 3 只就触发熔断，整轮 4834 只零成功。
+        #
+        # 退市股的历史另有 `sync --delisted` 走 Tushare 专门补。
+        if "status" in inst.columns:
+            alive = inst[inst["status"].fillna("listed") != "delisted"]
+            codes = alive["code"].tolist()
+        else:
+            codes = inst["code"].tolist()
 
     # only_missing：只补**本地完全没有数据**的股票，已有数据的一律跳过。
     #
@@ -577,6 +684,12 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
             back = (pd.to_datetime(last[code]) - timedelta(days=overlap_days))
             pending.append((code, back.strftime("%Y%m%d")))
 
+    # 落后最多的排前面。限流是必然会撞上的，一轮能抓多少只基本随机——
+    # 那就让有限的配额先花在最需要的股票上。不排序的话每次重跑都从头扫，
+    # 已经补好的反复重拉，真正缺的那批永远轮不到（实测：常规档卡在 343 只、
+    # 慢速档卡在 1808 只，而缺口有 3026 只，怎么重跑都补不完）。
+    pending.sort(key=lambda cs: last.get(cs[0], ""))
+
     stats = {"requested": len(codes), "pending": len(pending),
              "ok": 0, "failed": 0, "rows": 0, "passes": 0}
     if not pending:
@@ -586,12 +699,20 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
     done = 0
 
     def _sweep(batch: list[tuple[str, str]], workers: int) -> list[tuple[str, str]]:
-        """跑一遍，返回失败的（供下一轮重试）。"""
+        """跑一遍，返回失败的（供下一轮重试）。
+
+        连续失败到 ABORT_STREAK 就中止本轮：线程池撤不回已提交的任务，
+        只能让后续任务查到标志后直接空返回，不再发请求。
+        """
         nonlocal done
         failed: list[tuple[str, str]] = []
         starts = dict(batch)
+        run = {"streak": 0, "since": 0.0, "aborted": False}
         with ThreadPoolExecutor(max_workers=workers) as pool:
             def _wrap(code, start):
+                if run["aborted"]:
+                    return pd.DataFrame()
+
                 def _cb(src, rows):
                     if on_event:
                         on_event(code, src, rows)
@@ -606,9 +727,18 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
                     df = pd.DataFrame()
                 if df.empty:
                     failed.append((code, starts[code]))
+                    run["streak"] += 1
+                    if run["streak"] == 1:
+                        run["since"] = time.time()
+                    elif (not run["aborted"]
+                          and run["streak"] >= ABORT_STREAK
+                          and time.time() - run["since"] >= ABORT_SECONDS):
+                        run["aborted"] = True
+                        stats["aborted_passes"] = stats.get("aborted_passes", 0) + 1
                 else:
                     stats["rows"] += store.upsert_daily(df)
                     stats["ok"] += 1
+                    run["streak"] = 0
                     store.clear_sync_errors([code])   # 补上了就清掉失败记录
                 if progress and done % 50 == 0:
                     # failed 只能按"已尝试 - 已成功"算，不能用 total - ok，
@@ -620,8 +750,8 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
     # 多轮：每轮之后冷却，并进一步降低并发。上游的限流是累积触发的，
     # 一轮扫完时往往已经处于被限速状态，此时立刻重试注定失败——必须先等它恢复。
     remaining = pending
-    for pass_no, (workers, cooldown) in enumerate(
-            [(MAX_WORKERS, 0), (3, 60), (2, 120)], start=1):
+    passes = ((SLOW_WORKERS, 0), (SLOW_WORKERS, 300)) if slow else RETRY_PASSES
+    for pass_no, (workers, cooldown) in enumerate(passes, start=1):
         if not remaining:
             break
         # 检查取消信号
@@ -646,6 +776,29 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
 
 
 # ------------------------------------------------------------------ 退市股
+def sync_daily(codes: list[str] | None = None, full: bool = False,
+               progress=None, overlap_days: int = OVERLAP_DAYS,
+               only_missing: bool = False, on_event=None,
+               circuit_breaker: int = CIRCUIT_THRESHOLD,
+               cancel_check=None, slow: bool = False) -> dict:
+    """增量同步日线。`slow=True` 走慢速档，用于已被限流后把缺口补回来。
+
+    慢速档要调大模块级的 REQUEST_GAP，所以在这里包一层 try/finally 还原：
+    impl 里有三个返回点，逐个还原早晚漏掉一个，而漏掉的后果是这个进程此后
+    一直慢十倍——服务是长驻的，这种事很难查。
+    """
+    global REQUEST_GAP
+    before = REQUEST_GAP
+    if slow:
+        REQUEST_GAP = SLOW_GAP
+    try:
+        return _sync_daily_impl(codes, full, progress, overlap_days,
+                                only_missing, on_event, circuit_breaker,
+                                cancel_check, slow)
+    finally:
+        REQUEST_GAP = before
+
+
 def _retry(fn, *a, tries: int = 4, **kw):
     """交易所接口偶发 SSL 断连，退避重试。"""
     for i in range(tries):

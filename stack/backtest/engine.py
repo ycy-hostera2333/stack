@@ -66,6 +66,7 @@ class BacktestResult:
     trades: list[Trade] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
     skipped: dict = field(default_factory=dict)   # 因涨跌停/停牌被拦下的次数
+    warnings: list[str] = field(default_factory=list)  # 结果可信度上的告警
     analytics: dict = field(default_factory=dict)  # 回撤曲线/月度收益等，给界面用
 
     def to_json(self) -> dict:
@@ -78,6 +79,7 @@ class BacktestResult:
             "end": self.end,
             "metrics": self.metrics,
             "skipped": self.skipped,
+            "warnings": self.warnings,
             "equity": {
                 "dates": eq["date"].tolist() if not eq.empty else [],
                 "value": [round(v, 2) for v in eq["equity"]] if not eq.empty else [],
@@ -278,6 +280,18 @@ def run(strategy: Strategy, codes: list[str], start: str, end: str,
     if len(dates) < 2:
         result.metrics = {"error": "交易日不足，无法回测"}
         return result
+
+    # 库尾残日：同步中断或数据源部分失败会留下只有几百只股票的交易日。
+    # 引擎会把当天没有 K 线的几千只票判成停牌——不可买卖、持仓冻结计价。
+    # 不报错，绩效数字照出，只是最后那几天不作数。挡在引擎里，所有调用方都受益。
+    complete = store.last_complete_day()
+    if complete and dates[-1] > complete:
+        n = sum(1 for d in dates if d > complete)
+        result.warnings.append(
+            f"区间末尾 {n} 个交易日的数据不完整（库内最后一个完整交易日是 "
+            f"{complete}）。这些日子里大部分股票没有 K 线，会被判成停牌，"
+            f"最后这段的净值是冻住的，不作数。先跑 sync --daily，"
+            f"或把结束日设到 {complete}。")
 
     P = _prepare_panel(strategy, codes, start, end, cfg.warmup_days, dates)
     if P is None:

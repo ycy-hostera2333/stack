@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from functools import partial
 
@@ -22,7 +25,14 @@ from .backtest import engine
 from .data import source, store, universe
 from .strategies import all_strategies, get_strategy
 
-app = FastAPI(title="Stack · A股选股与信号系统", docs_url="/api/docs")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    _start_paper_daemon()
+    yield
+
+
+app = FastAPI(title="Stack · A股选股与信号系统", docs_url="/api/docs",
+              lifespan=_lifespan)
 store.init_db()
 
 
@@ -60,7 +70,9 @@ class UniverseReq(BaseModel):
 class BacktestReq(BaseModel):
     strategy: str
     start: str = "2021-01-01"
-    end: str = Field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d"))
+    # 默认到库内最后一个完整交易日，而不是今天——库尾残日会让最后几天冻住
+    end: str = Field(default_factory=lambda: (
+        store.last_complete_day() or datetime.now().strftime("%Y-%m-%d")))
     initial_cash: float = 200_000
     max_positions: int = 5
     stop_loss: float = 0.0
@@ -97,12 +109,29 @@ class SimulatorSaveReq(BaseModel):
     state: dict
 
 
+class PaperAccountReq(BaseModel):
+    account: str = Field(min_length=1, max_length=32)
+    strategy: str
+    params: dict = Field(default_factory=dict)
+    cash: float = 200_000
+    max_positions: int = 5
+    top: int = 400
+    max_hold_days: int = 0
+    since: str = ""          # 从该日回补，空则从今天开始记
+
+
+class PaperDaemonReq(BaseModel):
+    enabled: bool | None = None
+    auto_sync: bool | None = None
+
+
 # ------------------------------------------------------------------ 基础信息
 @app.get("/api/status")
 async def status():
     cov = await _run(store.coverage)
     return {
         **cov,
+        "last_complete_day": await _run(store.last_complete_day),
         "instruments_synced_at": store.get_meta("instruments_synced_at"),
         "daily_synced_at": store.get_meta("daily_synced_at"),
         "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -304,7 +333,7 @@ source_stats: dict = {"tencent": 0, "baostock": 0, "tushare": 0, "akshare": 0, "
 
 
 def _do_sync(full: bool, limit: int | None, only_missing: bool = False,
-             circuit_breaker: int = 3) -> None:
+             circuit_breaker: int = 3, slow: bool = False) -> None:
     _sync_log.clear()
     for k in source_stats:
         source_stats[k] = 0
@@ -346,7 +375,7 @@ def _do_sync(full: bool, limit: int | None, only_missing: bool = False,
         stats = source.sync_daily(codes=codes, full=full, progress=prog,
                                   only_missing=only_missing, on_event=_on_event,
                                   circuit_breaker=circuit_breaker,
-                                  cancel_check=_cancel_check)
+                                  cancel_check=_cancel_check, slow=slow)
         _sync_state.update(stats=stats, done=stats["pending"], total=stats["pending"],
                            updated_at=datetime.now().strftime("%H:%M:%S"))
         _sync_state["source_stats"] = dict(source_stats)
@@ -403,6 +432,263 @@ async def sync_log():
 async def data_gaps():
     """数据缺失检查：找滞后股票和没有日线的股票。"""
     return await _run(store.find_gaps)
+
+
+# ------------------------------------------------------------------ 模拟盘
+# 前向验证的唯一失败模式是断链：没人每天去跑 paper run，记录就悄悄停在某一天，
+# 半年后才发现只攒了三天数据。所以推进这件事不能靠人记得。
+
+PAPER_TICK_SECONDS = 30 * 60
+PAPER_FIRST_DELAY = 20            # 让服务先起来，别和启动抢资源
+
+_paper_daemon: dict = {
+    "enabled": True, "auto_sync": True, "running": False,
+    "phase": "未启动", "last_run": None, "error": None,
+    "advanced": {}, "data_lag": None, "creating": None,
+    "sync_backoff": 0, "next_sync_in": None, "sync_note": None,
+}
+_next_sync_at = 0.0                # 单调时钟上的下次允许同步时间
+
+
+def _paper_flag(key: str, default: bool = True) -> bool:
+    v = store.get_meta(f"paper_daemon_{key}")
+    return default if v is None else v == "1"
+
+
+def _source_alive() -> bool:
+    """轻量探活：走一遍 fallback 链抓一只票最近几天。
+
+    限流通常几十分钟就过去了，而退避最长会等到 8 小时——数据源早恢复了还在干等，
+    白白丢掉几天前向记录。一次请求就能知道该不该提前解除。
+    """
+    from datetime import timedelta
+
+    from .data import source
+
+    end = datetime.now()
+    start = (end - timedelta(days=12)).strftime("%Y-%m-%d")
+    try:
+        df = source.fetch_daily("600000", start=start,
+                                end=end.strftime("%Y-%m-%d"))
+        return df is not None and not df.empty
+    except Exception:
+        return False
+
+
+def _paper_tick() -> None:
+    """一次自愈：数据落后就同步，然后把每个账户推进到最新。"""
+    from . import paper
+
+    _paper_daemon["enabled"] = _paper_flag("enabled")
+    _paper_daemon["auto_sync"] = _paper_flag("auto_sync")
+    if not _paper_daemon["enabled"]:
+        _paper_daemon["phase"] = "已停用"
+        return
+
+    _paper_daemon.update(running=True, error=None, phase="检查数据")
+    try:
+        global _next_sync_at
+        stale = paper.data_lag_days()
+        _paper_daemon["data_lag"] = stale
+        now = time.monotonic()
+        if stale and _paper_daemon["auto_sync"]:
+            if now < _next_sync_at and not _source_alive():
+                wait = int((_next_sync_at - now) / 60)
+                _paper_daemon["next_sync_in"] = wait
+                _paper_daemon["phase"] = (f"行情落后 {stale} 天，"
+                                          f"数据源仍不通，{wait} 分钟后再试")
+            elif _sync_state["running"]:
+                _paper_daemon["phase"] = "手动同步进行中，本轮跳过同步"
+            else:
+                if _next_sync_at:      # 探活把退避提前解除了，记一笔
+                    _paper_daemon["sync_note"] = "数据源已恢复，提前结束退避重试"
+                    _next_sync_at = 0.0
+                # 已经退避过一轮，说明上游在限流——这时候再用常规档
+                # （33 请求/秒）去撞，几百只就又被封。改走慢速档。
+                slow = _paper_daemon.get("sync_backoff", 0) > 0
+                _paper_daemon["phase"] = (f"行情落后 {stale} 天，正在同步"
+                                          + ("（慢速档）" if slow else ""))
+                _do_sync(False, None, False, 3, slow)
+                after = paper.data_lag_days()
+                _paper_daemon["data_lag"] = after
+                if after < stale:
+                    _paper_daemon.update(sync_backoff=0, next_sync_in=None,
+                                         sync_note=None)
+                    _next_sync_at = 0.0
+                else:
+                    # 同步跑完了，行情一天都没往前挪——多半是数据源在限流或全挂。
+                    # 每 30 分钟拿几千次注定失败的请求去砸它们，既没用也不礼貌，
+                    # 还会让限流更久。指数退避，最长 8 小时。
+                    b = min(_paper_daemon.get("sync_backoff", 0) + 1, 4)
+                    failed = (_sync_state.get("stats") or {}).get("failed")
+                    _paper_daemon["sync_backoff"] = b
+                    _next_sync_at = time.monotonic() + PAPER_TICK_SECONDS * (2 ** b)
+                    _paper_daemon["next_sync_in"] = int(
+                        PAPER_TICK_SECONDS * (2 ** b) / 60)
+                    _paper_daemon["sync_note"] = (
+                        f"同步跑完了但行情仍停在库内最后一个完整交易日"
+                        + (f"，{failed} 只全部数据源都失败" if failed else "")
+                        + "。多半是数据源限流，等一等再说；"
+                        "急的话到「数据管理」手动重试。")
+
+        _paper_daemon["phase"] = "推进模拟盘"
+        adv = {}
+        for a in paper.list_accounts():
+            name = a["account"]
+            try:
+                adv[name] = paper.catch_up(verbose=False, account=name)
+            except Exception as e:
+                # 一个账户炸了不能拖垮其他账户，但也绝不能吞掉——记下来给界面看
+                adv[name] = f"失败：{type(e).__name__}: {e}"
+        _paper_daemon["advanced"] = adv
+        bad = [k for k, v in adv.items() if isinstance(v, str)]
+        _paper_daemon["phase"] = (f"完成，{len(bad)} 个账户出错" if bad else "完成")
+    finally:
+        _paper_daemon["running"] = False
+        _paper_daemon["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _paper_loop() -> None:
+    time.sleep(PAPER_FIRST_DELAY)
+    while True:
+        try:
+            _paper_tick()
+        except Exception as e:
+            _paper_daemon.update(
+                running=False, phase="失败",
+                error=f"{type(e).__name__}: {e}",
+                last_run=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        time.sleep(PAPER_TICK_SECONDS)
+
+
+_decay_running: set = set()
+_paper_thread: threading.Thread | None = None
+
+
+def _start_paper_daemon() -> None:
+    global _paper_thread
+    if _paper_thread and _paper_thread.is_alive():
+        return
+    _paper_thread = threading.Thread(target=_paper_loop, daemon=True,
+                                     name="paper-daemon")
+    _paper_thread.start()
+
+
+def _do_create_account(req: PaperAccountReq) -> None:
+    """新建账户并回补。回补要逐日推进，几十个交易日就是几十秒，所以走后台。"""
+    from . import paper
+
+    try:
+        _paper_daemon["creating"] = {"account": req.account, "phase": "建立账户",
+                                     "done": 0, "total": 0}
+        paper.reset(req.strategy, req.params, req.cash, req.max_positions,
+                    req.top, req.max_hold_days, account=req.account)
+        if req.since:
+            days = store.trading_days(start=req.since)
+            _paper_daemon["creating"].update(phase="回补", total=len(days))
+            done = 0
+            # 必须按日期升序逐日推进：advance 会把 last_date 前移，
+            # 一旦先处理了最新日期，之前的日期都会被「已处理过」的守卫挡掉
+            for d in days:
+                ev = paper.advance(as_of=d, verbose=False, account=req.account)
+                if ev.get("skipped"):
+                    continue
+                done += 1
+                _paper_daemon["creating"]["done"] = done
+        _paper_daemon["creating"].update(phase="完成")
+    except Exception as e:
+        _paper_daemon["creating"] = {"account": req.account, "phase": "失败",
+                                     "error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/paper/accounts")
+async def paper_accounts():
+    from . import paper
+
+    def _load():
+        rows = paper.list_accounts()
+        for r in rows:
+            r["lag_days"] = paper.lag_days(r["account"])
+        return {"accounts": rows, "data_lag_days": paper.data_lag_days()}
+
+    return _clean(await _run(_load))
+
+
+@app.get("/api/paper/status")
+async def paper_status(account: str = "default"):
+    from . import paper
+    return _clean(await _run(paper.status, account))
+
+
+@app.get("/api/paper/trades")
+async def paper_trades(account: str = "default", limit: int = 200):
+    from . import paper
+    return _clean(await _run(paper.trades, account, max(1, min(limit, 1000))))
+
+
+@app.post("/api/paper/accounts")
+async def paper_create(req: PaperAccountReq):
+    from . import paper
+
+    try:
+        paper.check_name(req.account)
+        get_strategy(req.strategy, **req.params)       # 参数不合法就别建了
+    except (ValueError, KeyError) as e:
+        raise HTTPException(400, str(e))
+    cur = _paper_daemon.get("creating")
+    if cur and cur.get("phase") not in ("完成", "失败", None):
+        raise HTTPException(409, f"正在建立账户 {cur['account']}，请稍候")
+    if (await _run(paper.status, req.account)).get("strategy"):
+        raise HTTPException(409, f"账户 {req.account} 已存在。"
+                                 "重置会清空它已积累的前向记录，请先删除再建。")
+    asyncio.get_running_loop().run_in_executor(None, _do_create_account, req)
+    return {"started": True, "account": req.account}
+
+
+@app.delete("/api/paper/accounts/{account}")
+async def paper_drop(account: str):
+    from . import paper
+
+    try:
+        paper.check_name(account)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return await _run(paper.drop_account, account)
+
+
+@app.get("/api/paper/decay")
+async def paper_decay(account: str = "default", refresh: bool = False):
+    """前向表现 vs 该策略历史分布。要跑一次历史回测，所以结果按天缓存。"""
+    from . import paper
+
+    if account in _decay_running:
+        raise HTTPException(409, "该账户的衰减报告正在计算中")
+    _decay_running.add(account)
+    try:
+        return _clean(await _run(paper.decay_report, account, 20, 4, refresh))
+    finally:
+        _decay_running.discard(account)
+
+
+@app.get("/api/paper/daemon")
+async def paper_daemon_status():
+    _paper_daemon["enabled"] = _paper_flag("enabled")
+    _paper_daemon["auto_sync"] = _paper_flag("auto_sync")
+    _paper_daemon["alive"] = bool(_paper_thread and _paper_thread.is_alive())
+    _paper_daemon["interval_seconds"] = PAPER_TICK_SECONDS
+    return _clean(_paper_daemon)
+
+
+@app.post("/api/paper/daemon")
+async def paper_daemon_set(req: PaperDaemonReq):
+    if req.enabled is not None:
+        store.set_meta("paper_daemon_enabled", "1" if req.enabled else "0")
+        _paper_daemon["enabled"] = req.enabled
+    if req.auto_sync is not None:
+        store.set_meta("paper_daemon_auto_sync", "1" if req.auto_sync else "0")
+        _paper_daemon["auto_sync"] = req.auto_sync
+    return {"enabled": _paper_daemon["enabled"],
+            "auto_sync": _paper_daemon["auto_sync"]}
 
 
 # ------------------------------------------------------------------ 前端

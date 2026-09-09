@@ -77,17 +77,25 @@ def cmd_sync(args) -> None:
             else:
                 codes = uni["code"].head(args.limit).tolist()
             print(f"同步日线（限流动性前 {len(codes)} 只）…")
+        elif args.slow:
+            print("同步全市场日线（慢速档，约 2.5 请求/秒，会比较久）…")
         else:
             print("同步全市场日线（首次约 15-30 分钟，中断后可重跑续传）…")
         stats = source.sync_daily(codes=codes, full=args.full,
                                   only_missing=args.only_missing,
-                                  progress=_progress)
+                                  progress=_progress, slow=args.slow)
         print(f"\n  待更新 {stats['pending']} 只，成功 {stats['ok']}，"
               f"失败 {stats['failed']}，写入 {stats['rows']:,} 行"
               f"（共 {stats.get('passes', 1)} 轮）")
+        if stats.get("aborted_passes"):
+            print(f"  有 {stats['aborted_passes']} 轮因连续大面积失败被提前中止"
+                  f"（判定为上游限流，继续打下去只会拖长封禁）。")
         if stats["failed"]:
             print(f"  仍有 {stats['failed']} 只未取到，多半是上游限流。"
-                  f"过一会儿重跑本命令会自动只补这些。")
+                  f"过一会儿重跑本命令会自动只补这些；")
+            print(f"  反复补不上就加 --slow：慢十倍但一次跑完，"
+                  f"好过重跑十几轮。（--only-missing 只跳过「从没取到过」的，"
+                  f"缺最近几天的这种它帮不上忙）")
 
     cov = store.coverage()
     print(f"\n本地库：{cov['codes_with_data']} 只有数据 / {cov['instruments']} 只已登记，"
@@ -118,6 +126,8 @@ def cmd_backtest(args) -> None:
     res = engine.run(strat, uni["code"].tolist(), args.start, args.end, cfg,
                      names=dict(zip(uni["code"], uni["name"])))
     print(f"完成，耗时 {time.time() - t0:.1f}s\n")
+    for w in res.warnings:
+        print(f"  ⚠ {w}\n")
     _print_metrics(res)
 
 
@@ -203,11 +213,37 @@ def cmd_list(args) -> None:
 def cmd_paper(args) -> None:
     from . import paper
 
+    acct = args.account
+
+    if args.action == "list":
+        rows = paper.list_accounts()
+        if not rows:
+            print("还没有任何模拟盘账户，先运行：paper init")
+            return
+        print(f"{'账户':<16}{'策略':<20}{'建于':<21}{'最后处理':<12}落后")
+        for r in rows:
+            lag = paper.lag_days(r["account"])
+            print(f"{r['account']:<16}{r['strategy'] or '':<20}"
+                  f"{r['created_at'] or '':<21}{r['last_date'] or '—':<12}"
+                  + (f"{lag} 个交易日" if lag else "已最新"))
+        return
+
+    if args.action == "drop":
+        st = paper.status(account=acct)
+        if not st.get("strategy"):
+            print(f"账户 {acct} 不存在")
+            return
+        n = paper.drop_account(acct)["removed"]
+        print(f"已删除账户 {acct}：净值 {n['paper_equity']} 天、"
+              f"成交 {n['paper_trade']} 笔、持仓 {n['paper_holding']} 只。"
+              "\n前向记录不可再生，删掉就没了。")
+        return
+
     if args.action == "init":
         params = json.loads(args.params) if args.params else {}
         paper.reset(args.strategy, params, args.cash, args.max_positions,
-                    args.top, args.max_hold_days)
-        print(f"模拟盘已建立：{args.strategy}  本金 {args.cash:,.0f}  "
+                    args.top, args.max_hold_days, account=acct)
+        print(f"模拟盘 {acct} 已建立：{args.strategy}  本金 {args.cash:,.0f}  "
               f"{args.max_positions} 仓位  股票池前 {args.top} 只  "
               + (f"每 {args.max_hold_days} 日调仓" if args.max_hold_days
                  else "无持有期上限"))
@@ -217,23 +253,23 @@ def cmd_paper(args) -> None:
             # 一旦先处理了最新日期，之前的日期都会被「已处理过」的守卫挡掉
             done = 0
             for d in store.trading_days(start=args.since):
-                ev = paper.advance(as_of=d, verbose=False)
+                ev = paper.advance(as_of=d, verbose=False, account=acct)
                 if not ev.get("skipped"):
                     done += 1
             print(f"  已回补 {done} 个交易日")
         return
 
     if args.action == "run":
-        n = paper.catch_up()
+        n = paper.catch_up(account=acct)
         print(f"推进了 {n} 个交易日" if n else "已是最新，无需推进")
 
-    st = paper.status()
+    st = paper.status(account=acct)
     if not st.get("strategy"):
-        print("模拟盘尚未初始化，先运行：paper init")
+        print(f"账户 {acct} 尚未初始化，先运行：paper init --account {acct}")
         return
 
     print(f"\n{'─'*60}")
-    print(f"  模拟盘 · {st['strategy']}   建于 {st['created_at']}")
+    print(f"  模拟盘 {st['account']} · {st['strategy']}   建于 {st['created_at']}")
     print(f"{'─'*60}")
     print(f"  本金 {st['initial_cash']:>12,.0f}      运行 {st['days']} 个交易日")
     if "equity" in st:
@@ -253,8 +289,18 @@ def cmd_paper(args) -> None:
                   f"成本 {h['cost']:>8.2f}  买于 {h['open_date']}  "
                   f"持有 {h['hold_days']}日")
     print(f"{'─'*60}")
-    print(f"  每天收盘后跑一次 `paper run`。这些记录一旦写下就不再改动——")
-    print(f"  半年后回看时，它才是真正没被调过参的未来数据。")
+    lag = st.get("lag_days", 0)
+    if lag:
+        print(f"  ⚠ 落后 {lag} 个交易日（最后处理到 {st['last_date']}）。"
+              "跑 `paper run` 追平。")
+    stale = paper.data_lag_days()
+    if stale:
+        print(f"  ⚠ 本地行情落后约 {stale} 个交易日，先跑 `sync --daily`，"
+              "否则模拟盘推不动。")
+    if not lag and not stale:
+        print("  已追平到最新交易日。")
+    print(f"  这些记录一旦写下就不再改动——半年后回看时，")
+    print(f"  它才是真正没被调过参的未来数据。")
 
 
 def cmd_factors(args) -> None:
@@ -322,13 +368,20 @@ def main(argv=None) -> int:
     s.add_argument("--only-missing", action="store_true",
                    help="只补从没取到过的股票，已有数据的跳过。上游限流后专门补缺用")
     s.add_argument("--limit", type=int, help="只同步流动性最好的前 N 只")
+    s.add_argument("--slow", action="store_true",
+                   help="慢速档（约 2.5 请求/秒）。被限流后补缺口用，"
+                        "慢十倍但一次跑完")
     s.set_defaults(func=cmd_sync)
 
     today = datetime.now().strftime("%Y-%m-%d")
+    # 回测/因子的默认结束日用库内最后一个完整交易日，不用今天：同步中断或
+    # 数据源部分失败会在库尾留下只有几百只的残日，拿它当结束日，最后几天
+    # 几千只票会被判成停牌，结果是冻住的——而且不报错。
+    last_ok = store.last_complete_day() or today
     b = sub.add_parser("backtest", help="回测策略")
     b.add_argument("strategy")
     b.add_argument("--start", default="2021-01-01")
-    b.add_argument("--end", default=today)
+    b.add_argument("--end", default=last_ok)
     b.add_argument("--cash", type=float, default=200_000)
     b.add_argument("--max-positions", type=int, default=5)
     b.add_argument("--stop-loss", type=float, default=0.0, help="如 0.08 表示 -8% 止损")
@@ -359,12 +412,12 @@ def main(argv=None) -> int:
     fa = sub.add_parser("factors", help="因子研究：IC 评估与分层回测")
     fa.add_argument("--name", help="只评估指定因子，给出 IC 衰减与分层明细")
     fa.add_argument("--start", default="2019-01-01")
-    fa.add_argument("--end", default=today)
+    fa.add_argument("--end", default=last_ok)
     fa.add_argument("--top", type=int, default=800, help="股票池取流动性前 N 只")
     fa.set_defaults(func=cmd_factors)
 
     pp = sub.add_parser("paper", help="前向模拟盘：逐日推进的虚拟账户")
-    pp.add_argument("action", choices=["init", "run", "status"],
+    pp.add_argument("action", choices=["init", "run", "status", "list", "drop"],
                     help="init=新建(清空重来)  run=推进到最新  status=只看状态")
     pp.add_argument("--strategy", default="regime_momentum")
     pp.add_argument("--params", help='策略参数 JSON')
@@ -376,6 +429,8 @@ def main(argv=None) -> int:
                          "exit() 恒为 False 的打分型策略（如 growth_value）必须设，"
                          "否则买满后永远不调仓")
     pp.add_argument("--since", help="init 时从该日期开始回补，如 2026-06-01")
+    pp.add_argument("--account", default="default",
+                    help="账户名。多个策略可并行前向验证，互不干扰")
     pp.set_defaults(func=cmd_paper)
 
     v = sub.add_parser("serve", help="启动 Web 界面")

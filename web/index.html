@@ -149,6 +149,7 @@ details summary{cursor:pointer;color:var(--dim);font-size:12px;padding:4px 0}
   <button class="on" data-p="signals">今日信号</button>
   <button data-p="backtest">策略回测</button>
   <button data-p="positions">我的持仓</button>
+  <button data-p="paper">模拟盘</button>
   <button data-p="replay">交易模拟</button>
   <button data-p="universe">股票池</button>
   <button data-p="data">数据管理</button>
@@ -203,6 +204,41 @@ details summary{cursor:pointer;color:var(--dim);font-size:12px;padding:4px 0}
 </section>
 
 <!-- ============================================ 持仓 -->
+<!-- ============================================ 模拟盘 -->
+<section class="page" id="p-paper">
+  <div id="pp-bar"></div>
+
+  <div class="card">
+    <h2>账户 <b id="pp-acct-note" class="dim"></b></h2>
+    <div class="row">
+      <label>当前<select id="pp-acct"></select></label>
+      <button class="mini" id="pp-toggle-new">新建账户</button>
+      <button class="mini" id="pp-drop">删除此账户</button>
+    </div>
+    <div id="pp-new" style="display:none;margin-top:12px;border-top:1px solid var(--line);padding-top:12px">
+      <div class="row">
+        <label>账户名<input id="pp-name" placeholder="momentum" maxlength="32"></label>
+        <label>策略<select id="pp-strategy"></select></label>
+        <label>本金<input type="number" id="pp-cash" value="200000" step="10000"></label>
+        <label>持仓数<input type="number" id="pp-maxpos" value="5" min="1" max="20"></label>
+        <label>股票池前 N<input type="number" id="pp-top" value="400" min="50" step="50"></label>
+        <label title="0 为不限。growth_value 这类 exit() 恒为 false 的打分策略必须设，否则买满就永远不动">
+          持有期上限<input type="number" id="pp-hold" value="0" min="0"></label>
+        <label title="留空则从今天开始记。回补的那段是回测、不是前向验证——它只是让曲线有个起点">
+          回补起始<input type="date" id="pp-since"></label>
+      </div>
+      <div class="dim" id="pp-desc" style="margin:6px 0"></div>
+      <div class="row" id="pp-params"></div>
+      <div class="row"><button id="pp-create">建立</button></div>
+      <div class="note">回补那段是拿历史数据算出来的，等同回测；只有建立之后逐日累积的
+      部分才是真正的前向验证。</div>
+    </div>
+  </div>
+
+  <div id="pp-out"></div>
+  <div id="pp-decay"></div>
+</section>
+
 <section class="page" id="p-positions">
   <div class="card">
     <h2>登记持仓</h2>
@@ -349,15 +385,21 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   // 切回回测页时画布刚从 display:none 变可见，尺寸可能已经变了，重画一次
   if (b.dataset.p==='backtest') setTimeout(redrawAll, 60);
   if (b.dataset.p==='positions') loadPositions();
+  if (b.dataset.p==='paper')     loadPaper();
   if (b.dataset.p==='replay') setTimeout(renderReplay, 60);
   if (b.dataset.p==='universe')  loadUniverse();
   if (b.dataset.p==='data')      { loadStatus(); loadLog(); }
 });
 
 /* ---------------------------------------------------- 状态 */
+let _btEndPinned = false;
 async function loadStatus(){
   try {
     const s = await api('/api/status');
+    // 回测结束日默认对齐库内最后一个完整交易日，别让用户一上来就跑到残日上
+    if(!_btEndPinned && s.last_complete_day){
+      $('#bt-end').value = s.last_complete_day; _btEndPinned = true;
+    }
     $('#status').innerHTML =
       `本地 ${s.codes_with_data.toLocaleString()} 只 / ${s.bars.toLocaleString()} 根 K 线` +
       `<br>数据截至 ${s.last_date ?? '—'}`;
@@ -379,7 +421,8 @@ async function loadStrategies(){
   const opts = STRATS.map(s=>`<option value="${s.name}">${esc(s.label)}</option>`).join('');
   $('#sg-strategy').innerHTML = opts;
   $('#bt-strategy').innerHTML = opts;
-  bindStrategy('sg'); bindStrategy('bt');
+  $('#pp-strategy').innerHTML = opts;
+  bindStrategy('sg'); bindStrategy('bt'); bindStrategy('pp');
 }
 
 /* 参数编辑器：完全由策略自己声明的 defaults / param_meta 驱动，
@@ -525,11 +568,17 @@ $('#bt-run').onclick = async () => {
     const m = r.metrics;
     if (m.error) { $('#bt-out').innerHTML = `<div class="err">${esc(m.error)}</div>`; return; }
 
+    // 引擎给的可信度告警（如区间末尾撞上库尾残日）必须摆在最上面，
+    // 否则用户看到的是一份看起来正常、其实最后几天冻住的绩效表
+    const warn = (r.warnings || []).map(w =>
+      `<div class="card" style="border-left:3px solid var(--warn)">
+         <b>结果可信度</b> <span class="dim">— ${esc(w)}</span></div>`).join('');
+
     const a = r.analytics || {};
     const kpi = (k,v,c,sub) => `<div class="kpi"><div class="k">${k}</div>
       <div class="v ${c||''}">${v}</div>${sub?`<div class="sub">${sub}</div>`:''}</div>`;
 
-    let h = `<div class="card">
+    let h = warn + `<div class="card">
       <h2>绩效总览 <b>${esc(r.strategy)}</b>
         <span class="dim" style="font-weight:400;text-transform:none;letter-spacing:0">
         ${r.start} ~ ${r.end} · 股票池 ${r.universe_size} 只</span></h2>
@@ -864,6 +913,213 @@ $('#ps-add').onclick = async () => {
   loadPositions();
 };
 
+/* ---------------------------------------------------- 模拟盘 */
+let PP = {acct: null, timer: null};
+
+async function loadPaper(){
+  try{
+    const [r, d] = await Promise.all([api('/api/paper/accounts'),
+                                      api('/api/paper/daemon')]);
+    PP.list = r.accounts; PP.dataLag = r.data_lag_days; PP.daemon = d;
+    if(!r.accounts.length){
+      $('#pp-bar').innerHTML = `<div class="card dim">还没有模拟盘账户。
+        新建一个，之后每天的决策会自动逐日记下来——那是唯一不能事后调参的验证。</div>`;
+      $('#pp-acct').innerHTML = ''; $('#pp-out').innerHTML = '';
+      $('#pp-new').style.display = 'block';
+      return;
+    }
+    if(!PP.acct || !r.accounts.some(a=>a.account===PP.acct)) PP.acct = r.accounts[0].account;
+    $('#pp-acct').innerHTML = r.accounts.map(a=>
+      `<option value="${esc(a.account)}"${a.account===PP.acct?' selected':''}>`
+      + `${esc(a.account)} · ${esc(a.strategy||'')}</option>`).join('');
+    renderPaperBar();
+    await loadPaperAccount();
+  }catch(e){ $('#pp-bar').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+}
+
+/* 断链是这套东西唯一的失败模式：没人推进，记录就悄悄停在某天，不报错。
+   所以两段落后（行情落后市场、模拟盘落后行情）都要摆在最上面。 */
+function renderPaperBar(){
+  const d = PP.daemon || {}, lag = (PP.list||[]).find(a=>a.account===PP.acct)?.lag_days || 0;
+  const rows = [];
+  if(PP.dataLag > 0) rows.push([`本地行情落后约 ${PP.dataLag} 个交易日`,
+    d.sync_note ? esc(d.sync_note)
+      : d.auto_sync ? '守护会自动同步'
+      : '自动同步已关，需手动到「数据管理」同步', 'warn']);
+  if(lag > 0) rows.push([`模拟盘落后 ${lag} 个交易日`, '守护会自动推进', 'warn']);
+  const c = d.creating;
+  if(c && c.phase && c.phase!=='完成')
+    rows.push([`正在建立账户 ${esc(c.account)}：${esc(c.phase)}`
+      + (c.total ? ` ${c.done}/${c.total}` : ''), esc(c.error||''), c.error?'err':'info']);
+  const bad = Object.entries(d.advanced||{}).filter(([,v])=>typeof v==='string');
+  bad.forEach(([k,v])=>rows.push([`账户 ${esc(k)} 推进失败`, esc(v), 'err']));
+  if(d.error) rows.push(['守护线程出错', esc(d.error), 'err']);
+  if(!rows.length) rows.push(['已追平到最新交易日', '', 'ok']);
+
+  const color = t => t==='err' ? 'var(--up)' : t==='warn' ? 'var(--warn)'
+                   : t==='ok' ? 'var(--down)' : 'var(--accent)';
+  $('#pp-bar').innerHTML = rows.map(([t,s,k])=>
+    `<div class="card" style="border-left:3px solid ${color(k)};padding:10px 14px">
+       <b>${t}</b>${s?` <span class="dim">— ${s}</span>`:''}</div>`).join('')
+    + `<div class="dim" style="margin:-4px 0 12px;font-size:12px">
+        守护 ${d.alive?'运行中':'未启动'}
+        · 每 ${Math.round((d.interval_seconds||1800)/60)} 分钟检查一次
+        · ${d.running ? '正在运行' : '上次 '+esc(d.last_run||'尚未运行')}${d.phase?`（${esc(d.phase)}）`:''}
+        · <label style="display:inline"><input type="checkbox" id="pp-en"
+            ${d.enabled?'checked':''}> 启用</label>
+        · <label style="display:inline"><input type="checkbox" id="pp-as"
+            ${d.auto_sync?'checked':''}> 落后时自动同步行情</label>
+       </div>`;
+  $('#pp-en').onchange = e => post('/api/paper/daemon', {enabled:e.target.checked}).then(loadPaper);
+  $('#pp-as').onchange = e => post('/api/paper/daemon', {auto_sync:e.target.checked}).then(loadPaper);
+}
+
+async function loadPaperAccount(){
+  const s = await api('/api/paper/status?account='+encodeURIComponent(PP.acct));
+  const tr = await api('/api/paper/trades?account='+encodeURIComponent(PP.acct));
+  $('#pp-acct-note').textContent = s.strategy
+    ? `${s.strategy} · 建于 ${s.created_at||'—'} · 本金 ${num(s.initial_cash,0)}`
+    + ` · ${s.max_positions} 仓 · 池前 ${s.top}`
+    + (s.max_hold_days ? ` · 持有上限 ${s.max_hold_days} 日` : '') : '';
+
+  if(!s.days){
+    $('#pp-out').innerHTML = `<div class="card dim">这个账户还没有任何净值记录。
+      同步好行情之后守护会把它推进到最新。</div>`;
+    return;
+  }
+  const excess = s.benchmark_return==null ? null : s.total_return - s.benchmark_return;
+  let h = `<div class="card"><h2>前向表现 <b class="dim">${s.days} 个交易日</b></h2>
+    <div class="grid">` + [
+    ['净值', num(s.equity,0), ''],
+    ['收益', spct(s.total_return), cls(s.total_return)],
+    ['沪深300', spct(s.benchmark_return), cls(s.benchmark_return)],
+    ['超额', spct(excess), cls(excess)],
+    ['最大回撤', pct(s.max_drawdown), ''],
+    ['已平仓', s.closed_trades + ' 笔', ''],
+    ['胜率', s.win_rate==null?'—':pct(s.win_rate,0), ''],
+    ['择时空仓', (s.idle_days||0) + ' 天', ''],
+  ].map(([k,v,c])=>`<div class="kpi"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`).join('')
+  + `</div></div>`;
+
+  h += `<div class="card"><h2>净值曲线</h2><canvas id="pp-eq"></canvas>
+    <div class="legend"><span><i style="background:var(--accent)"></i>模拟盘</span>
+    <span><i style="background:var(--dim)"></i>沪深300（归一到同一起点）</span></div>
+    <div class="note">${s.days < 20
+      ? '样本还太少，这条线说明不了任何问题。前向验证要的就是熬时间。'
+      : '这段记录一次性写下、之后不再改动，所以它没法事后调参。'}</div></div>`;
+
+  if(s.holdings?.length)
+    h += `<div class="card"><h2>当前持仓 ${s.holdings.length} 只</h2>
+      <div class="scroll"><table><thead><tr><th>代码</th><th>名称</th>
+      <th class="num">股数</th><th class="num">成本</th><th>买入日</th>
+      <th class="num">持有</th><th>买入理由</th></tr></thead><tbody>`
+      + s.holdings.map(p=>`<tr><td class="code">${p.code}</td><td>${esc(p.name)}</td>
+        <td class="num">${p.shares.toLocaleString()}</td><td class="num">${num(p.cost)}</td>
+        <td class="dim">${p.open_date??''}</td><td class="num">${p.hold_days??0} 日</td>
+        <td class="dim">${esc(p.open_reason??'')}</td></tr>`).join('')
+      + `</tbody></table></div></div>`;
+
+  if(tr.length)
+    h += `<div class="card"><h2>已平仓 ${tr.length} 笔</h2>
+      <div class="scroll"><table><thead><tr><th>代码</th><th>名称</th>
+      <th>买入</th><th>卖出</th><th class="num">股数</th><th class="num">盈亏</th>
+      <th class="num">收益率</th><th class="num">持有</th><th>卖出理由</th>
+      </tr></thead><tbody>`
+      + tr.map(t=>`<tr><td class="code">${t.code}</td><td>${esc(t.name)}</td>
+        <td class="dim">${t.open_date}</td><td class="dim">${t.close_date}</td>
+        <td class="num">${(t.shares||0).toLocaleString()}</td>
+        <td class="num ${cls(t.pnl)}">${num(t.pnl,0)}</td>
+        <td class="num ${cls(t.pnl_pct)}">${spct(t.pnl_pct)}</td>
+        <td class="num">${t.hold_days} 日</td>
+        <td class="dim">${esc(t.close_reason??'')}</td></tr>`).join('')
+      + `</tbody></table></div></div>`;
+
+  $('#pp-out').innerHTML = h;
+  // 衰减报告要跑一次历史回测，样本不够时连请求都不发
+  if(s.days >= 20) loadDecay(s.days);
+  const C = s.curve;
+  // 画布可能刚从 display:none 变可见，布局没完成时 clientWidth 还是 0，
+  // drawChart 会直接返回、什么都不画。让出一帧再画（回测页同理）。
+  setTimeout(() => chart('#pp-eq', {dates:C.dates, fmtY:v=>(v/10000).toFixed(1)+'万', series:[
+    {data:C.bench,  color:css('--dim'),    width:1.2},
+    {data:C.equity, color:css('--accent'), width:1.8},
+  ]}), 60);
+}
+
+async function loadDecay(days){
+  const box = $('#pp-decay');
+  if(!box) return;
+  box.innerHTML = `<div class="card dim">正在把前向这 ${days} 天放回历史分布里比对…
+    （要跑一次历史回测，首次约半分钟）</div>`;
+  try{
+    const d = await api('/api/paper/decay?account='+encodeURIComponent(PP.acct));
+    if(!d.enough){ box.innerHTML = `<div class="card dim">${esc(d.note||d.error||'')}</div>`; return; }
+    const p = d.percentile, bp = d.bench_percentile;
+    // 策略在低分位、大盘也在低分位 —— 那是市场，不是策略衰减。必须分得开。
+    const verdict = bp!=null && Math.abs(p-bp) < 0.15
+      ? '与同期大盘分位接近，看不出策略本身在衰减——这段表现主要是市场给的。'
+      : (p < 0.25 ? '明显落在历史分布下沿，而大盘没有同步走弱。样本仍短，但值得盯着。'
+      : p > 0.75 ? '落在历史分布上沿。短样本的高分位同样是噪声，别据此加码。'
+      : '落在历史分布中段，没有异常。');
+    box.innerHTML = `<div class="card"><h2>衰减对账
+      <b class="dim">${d.windows} 个历史窗口 · ${d.hist_start} ~ ${d.hist_end}</b></h2>
+      <div class="grid">` + [
+      ['前向收益', spct(d.forward_return), cls(d.forward_return)],
+      ['历史分位', pct(d.percentile,0), ''],
+      ['同期大盘分位', bp==null?'—':pct(bp,0), ''],
+      ['历史中位', spct(d.hist_median), cls(d.hist_median)],
+      ['历史 P10', spct(d.hist_p10), ''],
+      ['历史 P90', spct(d.hist_p90), ''],
+    ].map(([k,v,c])=>`<div class="kpi"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`).join('')
+    + `</div><div class="note">把前向这 ${d.days} 个交易日的收益，放回该策略历史上
+      所有等长窗口的分布里排位。${verdict}<br>
+      这不是「模拟盘对回测」的校验——那两者在同一区间上逐笔相等（自检有专门一项盯着），
+      相减恒为零。这里问的是另一件事：策略是不是已经不灵了。</div></div>`;
+  }catch(e){ box.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+}
+
+$('#pp-acct').onchange = e => { PP.acct = e.target.value; renderPaperBar(); loadPaperAccount(); };
+$('#pp-toggle-new').onclick = () => {
+  const box = $('#pp-new');
+  box.style.display = box.style.display==='none' ? 'block' : 'none';
+};
+$('#pp-drop').onclick = async () => {
+  if(!PP.acct) return;
+  if(!confirm(`删除账户「${PP.acct}」？\n\n前向记录不可再生——删掉之后，`
+    + `这段时间的验证就等于没做过。`)) return;
+  await api('/api/paper/accounts/'+encodeURIComponent(PP.acct), {method:'DELETE'});
+  PP.acct = null; loadPaper();
+};
+$('#pp-create').onclick = async () => {
+  const name = $('#pp-name').value.trim();
+  if(!name) return alert('请填账户名');
+  const btn = $('#pp-create'); btn.disabled = true;
+  try{
+    await post('/api/paper/accounts', {
+      account:name, strategy:$('#pp-strategy').value, params:collectParams('pp'),
+      cash:+$('#pp-cash').value, max_positions:+$('#pp-maxpos').value,
+      top:+$('#pp-top').value, max_hold_days:+$('#pp-hold').value,
+      since:$('#pp-since').value||''});
+    $('#pp-new').style.display='none'; $('#pp-name').value='';
+    PP.acct = name;
+    pollPaperCreate();
+  }catch(e){ alert(e.message); }
+  finally{ btn.disabled = false; }
+};
+
+/* 回补要逐日推进，几十个交易日就是几十秒，所以建账户是后台任务 */
+function pollPaperCreate(){
+  clearInterval(PP.timer);
+  PP.timer = setInterval(async () => {
+    const d = await api('/api/paper/daemon').catch(()=>null);
+    if(!d) return;
+    PP.daemon = d; renderPaperBar();
+    if(!d.creating || ['完成','失败'].includes(d.creating.phase)){
+      clearInterval(PP.timer); PP.timer = null; loadPaper();
+    }
+  }, 1500);
+}
+
 /* ---------------------------------------------------- 股票池 */
 async function loadUniverse(){
   $('#u-out').innerHTML = '<div class="card"><span class="spin"></span> 计算中…</div>';
@@ -1076,6 +1332,7 @@ $('#rp-load-save').onclick=async()=>{const user=$('#rp-saves').value||$('#rp-use
 
 /* ---------------------------------------------------- 启动 */
 const today = new Date().toISOString().slice(0,10);
+// 先用今天占位，loadStatus 拿到库内最后一个完整交易日后再校正（见 loadStatus）
 $('#bt-end').value = today; $('#ps-date').value = today;
 $('#rp-end').value=today; $('#rp-start').value='2021-01-01'; loadReplayStocks();
 loadStatus(); loadStrategies(); pollSync();

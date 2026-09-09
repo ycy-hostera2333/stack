@@ -283,29 +283,10 @@ def _t_limits():
 
 
 # ------------------------------------------------------------------ 数据
-_PAPER_TABLES = ("paper_meta", "paper_holding", "paper_trade", "paper_equity")
-
-
-def _paper_snapshot() -> dict:
-    """整表备份模拟盘。自检要跑 paper.reset，而 reset 会清空所有记录——
-    只备份 meta 是不够的：持仓、成交、净值曲线一样会被冲掉，而那些是不可再生的
-    前向记录（模拟盘的全部价值就在于它不可回溯）。"""
-    from . import paper
-    paper._init()
-    with store.connect() as c:
-        return {t: c.execute(f"SELECT * FROM {t}").fetchall() for t in _PAPER_TABLES}
-
-
-def _paper_restore(snap: dict) -> None:
-    from . import paper
-    paper._init()
-    with store.connect() as c:
-        for t in _PAPER_TABLES:
-            rows = snap.get(t) or []
-            c.execute(f"DELETE FROM {t}")
-            if rows:
-                ph = ",".join("?" * len(rows[0]))
-                c.executemany(f"INSERT INTO {t} VALUES ({ph})", rows)
+# 自检跑在自己的账户里。早先的做法是整表备份再还原，但那有个要命的缺口：
+# 自检中途被 Ctrl-C 或崩掉，用户的前向记录就停在「已清空、还没还原」的状态，
+# 而那是不可再生的。跑在专属账户上，用户的记录压根不进入操作范围。
+SELFTEST_ACCOUNT = "__selftest__"
 
 
 def _paper_vs_engine(strategy: str, params: dict, cfg: engine.BacktestConfig,
@@ -321,12 +302,13 @@ def _paper_vs_engine(strategy: str, params: dict, cfg: engine.BacktestConfig,
     uni_mod.build = lambda flt=None, as_of=None: fdf
     try:
         paper.reset(strategy, params, cfg.initial_cash, cfg.max_positions,
-                    top, cfg.max_hold_days)
+                    top, cfg.max_hold_days, account=SELFTEST_ACCOUNT)
         for d in store.trading_days(start=start, end=end):
-            paper.advance(as_of=d, verbose=False)
+            paper.advance(as_of=d, verbose=False, account=SELFTEST_ACCOUNT)
         with store.connect() as c:
             pt = pd.read_sql("SELECT code,open_date,close_date,shares,pnl "
-                             "FROM paper_trade", c)
+                             "FROM paper_trade WHERE account=?", c,
+                             params=(SELFTEST_ACCOUNT,))
     finally:
         uni_mod.build = orig
 
@@ -338,11 +320,20 @@ def _paper_vs_engine(strategy: str, params: dict, cfg: engine.BacktestConfig,
 
 @check("模拟盘：与回测引擎逐笔等价（同一股票池、同一区间）")
 def _t_paper_equiv():
+    from . import paper
     from .data import universe as uni_mod
 
     days = store.trading_days()
     if len(days) < 40:
         return "跳过：交易日不足"
+    # 残日必须排除在外。模拟盘会拒绝在残日上推进（照着几百只的残缺名单建仓
+    # 是错的），引擎没有这层保护，两边自然对不上笔数。更要紧的是：在残日上
+    # 比出来的「一致」本身没有意义——那是两边一起错得一样。
+    complete = store.last_complete_day()
+    if complete and complete in days:
+        days = days[:days.index(complete) + 1]
+    if len(days) < 40:
+        return "跳过：完整交易日不足"
     end = days[-1]
     start = days[-31]                      # 最近约 30 个交易日
     eng_start = days[-32]                  # 引擎提前一日，使首个可交易日对齐
@@ -367,7 +358,6 @@ def _t_paper_equiv():
             initial_cash=200_000, max_positions=5, max_hold_days=5)),
     ]
 
-    snap = _paper_snapshot()
     notes = []
     try:
         for name, params, cfg in cases:
@@ -384,9 +374,192 @@ def _t_paper_equiv():
             assert (abs(et["pnl"].values - pt["pnl"].values) < 0.05).all(),                 f"{name} 盈亏不一致"
             notes.append(f"{name} {len(et)} 笔一致")
     finally:
-        # 整表还原：自检绝不能把用户的前向记录冲掉
-        _paper_restore(snap)
+        # 只清自己的账户；用户的前向记录自始至终没被碰过
+        paper.drop_account(SELFTEST_ACCOUNT)
     return "；".join(notes)
+
+
+@check("模拟盘：多账户互不串台，且账户名非法时报错")
+def _t_paper_accounts():
+    """四张表原本是单账户的（主键不含 account）。迁移之后如果哪个查询漏了
+    WHERE account=?，两个账户的持仓会混在一起——不报错，只是从此两个账户
+    记的都不是自己的仓位，而前向记录一旦记错就没法回头重来。"""
+    from . import paper
+
+    a, b = "__selftest_a__", "__selftest_b__"
+    try:
+        paper.reset("ma_cross", {}, 100_000, 3, 50, 0, account=a)
+        paper.reset("turtle_breakout", {}, 500_000, 5, 60, 10, account=b)
+
+        sa, sb = paper.status(account=a), paper.status(account=b)
+        assert sa["strategy"] == "ma_cross" and sb["strategy"] == "turtle_breakout", \
+            f"策略串台：a={sa['strategy']} b={sb['strategy']}"
+        assert sa["initial_cash"] == 100_000 and sb["initial_cash"] == 500_000, \
+            f"本金串台：a={sa['initial_cash']} b={sb['initial_cash']}"
+        assert sb["max_hold_days"] == 10 and sa["max_hold_days"] == 0, \
+            "持有期上限串台"
+
+        # 同一只票同时挂在两个账户下：老 schema 的 code 主键会在这里撞车
+        with store.connect() as c:
+            for acct, shares in ((a, 100), (b, 200)):
+                c.execute("INSERT INTO paper_holding (account,code,name,shares,"
+                          "cost,open_date,open_reason,peak,hold_days) "
+                          "VALUES (?,?,?,?,?,?,?,?,0)",
+                          (acct, "600000", "浦发银行", shares, 10.0,
+                           "2026-01-05", "构造", 10.0))
+        ha = paper._holdings(a)
+        hb = paper._holdings(b)
+        assert ha["600000"]["shares"] == 100 and hb["600000"]["shares"] == 200, \
+            f"同票不同户读串了：a={ha['600000']['shares']} b={hb['600000']['shares']}"
+
+        # 删掉 a 不能碰到 b
+        paper.drop_account(a)
+        assert not paper.status(account=a)["strategy"], "账户 a 未被删净"
+        assert paper.status(account=b)["strategy"] == "turtle_breakout", \
+            "删 a 把 b 一起删了"
+        assert paper._holdings(b), "删 a 把 b 的持仓也删了"
+
+        for bad in ("", "   ", "a" * 33, "a/b", "a;drop"):
+            try:
+                paper.check_name(bad)
+            except ValueError:
+                continue
+            raise AssertionError(f"非法账户名 {bad!r} 应当被拒绝")
+    finally:
+        paper.drop_account(a)
+        paper.drop_account(b)
+    return "两账户隔离、同票不同户、删除不误伤、非法名被拒"
+
+
+@check("模拟盘：老库（无 account 列）迁移后一行不丢，且可重复迁移")
+def _t_paper_migration():
+    """迁移只跑一次，跑错了就把不可再生的前向记录搞没了。所以在临时库上
+    重演一遍：造老 schema、灌数据、迁移，逐字段比对。"""
+    import sqlite3
+    import tempfile
+
+    from . import paper
+
+    old = """
+    CREATE TABLE paper_meta (key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE paper_holding (
+        code TEXT PRIMARY KEY, name TEXT, shares INTEGER, cost REAL,
+        open_date TEXT, open_reason TEXT, peak REAL, hold_days INTEGER DEFAULT 0);
+    CREATE TABLE paper_trade (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT, name TEXT, open_date TEXT, close_date TEXT, shares INTEGER,
+        open_price REAL, close_price REAL, pnl REAL, pnl_pct REAL,
+        hold_days INTEGER, open_reason TEXT, close_reason TEXT);
+    CREATE TABLE paper_equity (
+        date TEXT PRIMARY KEY, equity REAL, cash REAL, positions INTEGER,
+        bench REAL, note TEXT);
+    """
+    seed = {
+        "paper_meta": [("strategy", "growth_value"), ("cash", "4043.06"),
+                       ("initial_cash", "200000.0"), ("last_date", "2026-08-17")],
+        "paper_holding": [("600000", "浦发银行", 1000, 10.5,
+                           "2026-08-10", "买入理由", 11.0, 3)],
+        "paper_trade": [(1, "000001", "平安银行", "2026-07-01", "2026-07-20",
+                         500, 12.0, 13.0, 480.5, 0.08, 13, "开仓", "平仓")],
+        "paper_equity": [("2026-08-17", 203000.0, 4043.06, 5, 4100.5, "")],
+    }
+
+    with tempfile.TemporaryDirectory() as td:
+        path = f"{td}/legacy.db"
+        c = sqlite3.connect(path)
+        try:
+            c.executescript(old)
+            for t, rows in seed.items():
+                ph = ",".join("?" * len(rows[0]))
+                c.executemany(f"INSERT INTO {t} VALUES ({ph})", rows)
+            c.commit()
+
+            for _ in range(3):                 # 幂等：迁移三次结果必须一样
+                paper._migrate(c)
+                for ddl in paper._DDL.values():
+                    c.execute(ddl)
+            c.commit()
+
+            legacy = dict(paper._LEGACY_COLS,
+                          paper_trade="id,code,name,open_date,close_date,shares,"
+                                      "open_price,close_price,pnl,pnl_pct,"
+                                      "hold_days,open_reason,close_reason")
+            for t, rows in seed.items():
+                cols = {r[1] for r in c.execute(f"PRAGMA table_info({t})")}
+                assert "account" in cols, f"{t} 迁移后没有 account 列"
+                got = c.execute(f"SELECT {legacy[t]} FROM {t} "
+                                "ORDER BY rowid").fetchall()
+                assert got == rows, f"{t} 数据在迁移中变了：{got} != {rows}"
+                n = c.execute(f"SELECT COUNT(*) FROM {t} "
+                              "WHERE account='default'").fetchone()[0]
+                assert n == len(rows), \
+                    f"{t} 有 {len(rows) - n} 行没归到 default 账户"
+
+            assert not c.execute("SELECT name FROM sqlite_master "
+                                 "WHERE name LIKE '%_old'").fetchall(), \
+                "迁移留下了 _old 残表"
+
+            # 上次迁移中途崩掉会留下 _old，再迁移必须能自愈而不是撞名报错
+            c.execute("CREATE TABLE paper_meta_old (key TEXT, value TEXT)")
+            c.commit()
+            paper._migrate(c)
+            c.commit()
+            assert c.execute("SELECT COUNT(*) FROM paper_meta").fetchone()[0] == \
+                len(seed["paper_meta"]), "自愈后 paper_meta 数据不完整"
+        finally:
+            c.close()
+    return f"4 张表逐字段一致、迁移 3 次幂等、_old 残留可自愈"
+
+
+@check("回测：结束日撞上库尾残日必须告警，默认结束日不能落在残日上")
+def _t_backtest_tail():
+    """库尾残日（同步中断或数据源部分失败留下的、只有几百只股票的交易日）
+    一旦进了回测区间，当天没有 K 线的几千只票会被引擎判成停牌——不可买卖、
+    持仓冻结计价。绩效数字照样出得来，只是最后那几天是假的，而且不报错。
+
+    实测过一次：4 个数据源同时失败，库尾 6 天每天只剩 633 只沪市主板，
+    而回测的默认结束日是「今天」，正好全踩上。
+    """
+    complete = store.last_complete_day()
+    assert complete, "last_complete_day 不该为空"
+
+    # 默认结束日：API 与 CLI 用的是同一个 store.last_complete_day()
+    from .api import BacktestReq
+    req = BacktestReq(strategy="ma_cross")
+    assert req.end <= complete, (
+        f"回测默认结束日 {req.end} 晚于库内最后一个完整交易日 {complete}，"
+        "最后几天会落在残日上")
+
+    days = store.trading_days()
+    if len(days) < 60:
+        return "跳过：交易日不足"
+
+    uni = universe.build(as_of=days[-40])
+    if uni.empty or len(uni) < 30:
+        return f"默认结束日 {req.end} 已对齐；股票池不足，未验证告警"
+    codes = uni["code"].tolist()[:30]
+    names = dict(zip(uni["code"], uni["name"]))
+    strat = get_strategy("ma_cross")
+    cfg = engine.BacktestConfig(initial_cash=200_000, max_positions=3)
+    start = days[-40]
+
+    # 结束日对齐完整交易日时不该有任何告警
+    clean = engine.run(strat, codes, start, complete, cfg, names)
+    assert not clean.warnings, f"结束日已对齐 {complete}，不该告警：{clean.warnings}"
+
+    if days[-1] == complete:
+        return f"库尾无残日；默认结束日 {req.end} 已对齐，干净区间无告警"
+
+    # 库里当前就有残日，把它拿进区间，必须告警
+    dirty = engine.run(strat, codes, start, days[-1], cfg, names)
+    assert dirty.warnings, (
+        f"区间末尾 {days[-1]} 是残日（完整日只到 {complete}），却一条告警都没有")
+    n_tail = sum(1 for d in store.trading_days(start=start, end=days[-1])
+                 if d > complete)
+    assert str(n_tail) in dirty.warnings[0], (
+        f"告警里没说清有几天不完整：{dirty.warnings[0]}")
+    return (f"默认结束日 {req.end} 已对齐；干净区间无告警；"
+            f"含 {n_tail} 个残日的区间已告警")
 
 
 @check("打分：打分型策略在模拟盘与每日信号里都必须真正打分")
@@ -527,9 +700,23 @@ def _t_partial_tail():
     used, _ = sig_mod._latest_usable_date()
     assert used is None or dict(rows).get(used, med) >= med * 0.5,         f"每日信号用了残日 {used}（{dict(rows).get(used)} 行，中位数 {med}）"
 
+    # 回补路径（--since / 建账户）用显式 as_of 推进，曾经绕过上面这层保护：
+    # trading_days() 里库尾那几个残日会被一并推进，照残缺名单建仓，不报错。
+    # 保护挡在 advance() 内部，所以这里直接拿残日去敲它。
     tail = rows[0][0]
     if tail != complete:
-        return f"库尾 {tail} 只有 {rows[0][1]} 行，已回退到 {complete}（{got} 行）"
+        from . import paper
+        acct = "__selftest_tail__"
+        try:
+            paper.reset("ma_cross", {}, 100_000, 3, 50, 0, account=acct)
+            ev = paper.advance(as_of=tail, verbose=False, account=acct)
+            assert ev.get("skipped"), (
+                f"模拟盘接受了残日 {tail}（{rows[0][1]} 行，中位数 {med}），"
+                "会照着残缺的候选名单建仓")
+        finally:
+            paper.drop_account(acct)
+        return (f"库尾 {tail} 只有 {rows[0][1]} 行，已回退到 {complete}（{got} 行）；"
+                "模拟盘也拒绝了显式推进到该日")
     return f"库尾 {tail} 完整（{got} 行，中位数 {med}）"
 
 
