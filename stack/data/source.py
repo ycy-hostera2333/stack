@@ -636,7 +636,8 @@ def _sync_daily_impl(codes: list[str] | None = None, full: bool = False,
                      progress=None, overlap_days: int = OVERLAP_DAYS,
                      only_missing: bool = False, on_event=None,
                      circuit_breaker: int = CIRCUIT_THRESHOLD,
-                     cancel_check=None, slow: bool = False) -> dict:
+                     cancel_check=None, slow: bool = False,
+                     behind_only: bool = False) -> dict:
     """增量同步日线。
 
     增量更新不是从"本地最后日期 + 1 天"开始，而是**往回退 overlap_days 天重新抓**，
@@ -691,6 +692,7 @@ def _sync_daily_impl(codes: list[str] | None = None, full: bool = False,
     # sync_errors 仍然保留，用于界面展示哪些股票失败过、失败原因是什么。
     last = {} if full else store.last_dates()
     today = datetime.now().strftime("%Y-%m-%d")
+    _complete = store.last_complete_day() if behind_only else None
 
     # 只有当"本地已有今天的数据"且"上次同步发生在今天收盘之后"时，才认为数据已是最终版，
     # 可以整只跳过。盘中同步写下的当日 K 线不满足后一条，下次会被重新抓取覆盖。
@@ -701,6 +703,18 @@ def _sync_daily_impl(codes: list[str] | None = None, full: bool = False,
     for code in codes:
         if full or code not in last:
             pending.append((code, HISTORY_START))
+        elif behind_only and _complete and last.get(code, "") >= _complete:
+            # --behind：这只已经有最新完整交易日的数据了，跳过。
+            #
+            # 默认的增量同步为了覆盖盘中写下的残缺 K 线，会把**每一只**都往回
+            # 重拉 7 天。数据断过几天再来补的时候，这意味着绝大多数请求是白发的：
+            # 实测断 3 天后，4599 只里 3397 只已经是最新的，74% 的请求纯属浪费，
+            # 还把限流额度提前打光，真正缺的那 1202 只反而补不上。
+            #
+            # 只能当补缺工具用，不能设成默认：日常收盘后更新时，
+            # last_complete_day 还停在昨天，所有股票都「已到该日」，
+            # 全跳过就永远拉不到今天的数据。
+            continue
         elif only_missing:
             # 本地已有数据 → 跳过。这正是 --only-missing 的意义：
             # 补缺时重拉几千只已有的股票既慢又会再次触发限流，
@@ -810,7 +824,8 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
                progress=None, overlap_days: int = OVERLAP_DAYS,
                only_missing: bool = False, on_event=None,
                circuit_breaker: int = CIRCUIT_THRESHOLD,
-               cancel_check=None, slow: bool = False) -> dict:
+               cancel_check=None, slow: bool = False,
+               behind_only: bool = False) -> dict:
     """增量同步日线。`slow=True` 走慢速档，用于已被限流后把缺口补回来。
 
     慢速档要调大模块级的 REQUEST_GAP，所以在这里包一层 try/finally 还原：
@@ -824,7 +839,7 @@ def sync_daily(codes: list[str] | None = None, full: bool = False,
     try:
         return _sync_daily_impl(codes, full, progress, overlap_days,
                                 only_missing, on_event, circuit_breaker,
-                                cancel_check, slow)
+                                cancel_check, slow, behind_only)
     finally:
         REQUEST_GAP = before
 

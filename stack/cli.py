@@ -77,13 +77,17 @@ def cmd_sync(args) -> None:
             else:
                 codes = uni["code"].head(args.limit).tolist()
             print(f"同步日线（限流动性前 {len(codes)} 只）…")
+        elif args.behind:
+            print("同步日线（只补落后于最后一个完整交易日的股票）…"
+                  + ("慢速档" if args.slow else ""))
         elif args.slow:
             print("同步全市场日线（慢速档，约 2.5 请求/秒，会比较久）…")
         else:
             print("同步全市场日线（首次约 15-30 分钟，中断后可重跑续传）…")
         stats = source.sync_daily(codes=codes, full=args.full,
                                   only_missing=args.only_missing,
-                                  progress=_progress, slow=args.slow)
+                                  progress=_progress, slow=args.slow,
+                                  behind_only=args.behind)
         print(f"\n  待更新 {stats['pending']} 只，成功 {stats['ok']}，"
               f"失败 {stats['failed']}，写入 {stats['rows']:,} 行"
               f"（共 {stats.get('passes', 1)} 轮）")
@@ -371,6 +375,9 @@ def main(argv=None) -> int:
     s.add_argument("--slow", action="store_true",
                    help="慢速档（约 2.5 请求/秒）。被限流后补缺口用，"
                         "慢十倍但一次跑完")
+    s.add_argument("--behind", action="store_true",
+                   help="只拉落后于最后一个完整交易日的股票。"
+                        "断了几天再来补时用，能省掉绝大多数请求")
     s.set_defaults(func=cmd_sync)
 
     today = datetime.now().strftime("%Y-%m-%d")

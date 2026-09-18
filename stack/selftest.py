@@ -615,6 +615,55 @@ def _t_catch_up_daily():
     return f"落后 {len(want)} 天逐日补齐无空洞；新账户只推进 1 天"
 
 
+@check("同步：--behind 只拉落后的股票，不把已经最新的几千只重扫一遍")
+def _t_sync_behind():
+    """默认的增量同步为了覆盖盘中写下的残缺 K 线，会把**每一只**都往回重拉 7 天。
+    数据断过几天再来补时，绝大多数请求是白发的——实测断 3 天后，4599 只里
+    3397 只已经是最新的，74% 的请求纯属浪费，还把限流额度提前打光，
+    真正缺的那 1202 只反而补不上。
+
+    这里用 cancel_check 让同步在发第一个请求前就返回，只比对它算出来的待更新
+    名单，不碰网络。
+    """
+    from .data import source
+
+    complete = store.last_complete_day()
+    if not complete:
+        return "跳过：没有完整交易日"
+
+    def stop():
+        return True
+
+    plain = source.sync_daily(cancel_check=stop)
+    behind = source.sync_daily(cancel_check=stop, behind_only=True)
+
+    inst = store.load_instruments()
+    alive = inst[inst["status"].fillna("listed") != "delisted"]["code"].tolist()
+    last = store.last_dates()
+    want = len([c for c in alive if last.get(c, "") < complete])
+
+    # 不做精确相等：后台跑着同步时 last_dates 每秒都在变，算期望值和 sync_daily
+    # 算待更新名单不在同一瞬间，实测差过 32 只。那种假失败比不检查更糟。
+    # 这里校验的是数量级关系，足以抓住「--behind 没生效」这个真问题。
+    assert behind["pending"] <= plain["pending"], (
+        f"--behind 反而比默认拉得多：{behind['pending']} > {plain['pending']}")
+    assert behind["pending"] <= want * 1.5 + 100, (
+        f"--behind 待更新 {behind['pending']} 只，远超真正落后的 {want} 只——"
+        "跳过逻辑多半没生效")
+    if plain["pending"] > want + 200:
+        assert behind["pending"] < plain["pending"], (
+            f"有 {plain['pending'] - want} 只已是最新却没被 --behind 跳过")
+
+    # 退市股不该出现在任何一边的待更新名单里（免费源永远取不到）
+    assert plain["requested"] == len(alive), (
+        f"日常同步请求了 {plain['requested']} 只，在册非退市只有 {len(alive)} 只——"
+        "退市股又混进来了")
+
+    saved = plain["pending"] - behind["pending"]
+    return (f"默认 {plain['pending']} 只 -> --behind {behind['pending']} 只，"
+            f"省掉 {saved} 次请求")
+
+
 @check("打分：打分型策略在模拟盘与每日信号里都必须真正打分")
 def _t_score_spread():
     """score_fields 类策略的 score() 是占位符，真正的横截面合成要在
