@@ -148,6 +148,14 @@ def _pct(v, d=1):
 def report(st: dict) -> None:
     c = st["cover"]
     W = 78
+    if not c["bars"]:
+        # 空库（刚克隆、还没同步）上后面每一节都在空转：年份分布为空时 min() 抛
+        # ValueError，涨跌停占比会除零。那属于「还没数据」而不是「算错了」，
+        # 所以只给一句提示，不甩 traceback。
+        print("本地库还没有行情数据，没什么可统计的。先同步：")
+        print("  python -m stack.cli sync --instruments --index")
+        print("  python -m stack.cli sync --daily")
+        return
     print("=" * W)
     print(f"  本地行情库统计    {c['first']} ~ {c['last']}")
     print("=" * W)

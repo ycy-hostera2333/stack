@@ -136,6 +136,24 @@ details summary{cursor:pointer;color:var(--dim);font-size:12px;padding:4px 0}
 .params label{position:relative}
 .params input,.params select{min-width:96px}
 .params .reset{align-self:flex-end;margin-bottom:1px}
+
+/* 策略实验室：网页上的代码编辑器。
+   字体用等宽、tab-size 固定 4，避免把别人代码里的缩进显示成一团。 */
+textarea.code-edit{width:100%;min-height:440px;margin-top:10px;resize:vertical;
+  background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+  border-radius:6px;padding:12px 14px;tab-size:4;white-space:pre;
+  overflow:auto;font:13px/1.6 ui-monospace,Consolas,"Cascadia Mono",monospace}
+textarea.code-edit:focus{outline:none;border-color:var(--accent)}
+textarea.code-edit.bad{border-color:var(--up)}
+pre.code-view,pre.code-err{margin:10px 0 0;padding:12px 14px;border-radius:6px;
+  background:var(--panel2);border:1px solid var(--line);overflow:auto;
+  max-height:440px;white-space:pre;color:var(--fg);
+  font:12.5px/1.55 ui-monospace,Consolas,monospace}
+pre.code-err{border-color:rgba(240,83,79,.35);background:rgba(240,83,79,.06);
+  max-height:260px;white-space:pre-wrap}
+.lab-hint{font-size:12px;color:var(--dim);margin-top:8px;line-height:1.7}
+.lab-hint code{background:var(--panel2);border:1px solid var(--line);
+  border-radius:3px;padding:0 4px;font-size:11.5px}
 </style>
 </head>
 <body>
@@ -148,6 +166,7 @@ details summary{cursor:pointer;color:var(--dim);font-size:12px;padding:4px 0}
 <nav>
   <button class="on" data-p="signals">今日信号</button>
   <button data-p="backtest">策略回测</button>
+  <button data-p="strategy">策略实验室</button>
   <button data-p="positions">我的持仓</button>
   <button data-p="paper">模拟盘</button>
   <button data-p="replay">交易模拟</button>
@@ -201,6 +220,83 @@ details summary{cursor:pointer;color:var(--dim);font-size:12px;padding:4px 0}
     <div class="note" id="bt-desc"></div>
   </div>
   <div id="bt-out"></div>
+</section>
+
+<!-- ============================================ 策略实验室 -->
+<section class="page" id="p-strategy">
+  <div class="warn">
+    在这里写策略、当场跑，不用改代码、不用重启。<b>保存前会过三道关</b>：语法/运行错误、
+    <b>前视偏差</b>（用了未来数据）、返回值格式——这三类错在回测里都是<b>静默的</b>：
+    引擎会把 <code>entry()</code> 抛的异常吞掉（表现为「这策略从来不出信号」），
+    未来数据则只会让收益凭空变好看。检查不过就不让保存。
+  </div>
+
+  <div class="cards2">
+    <div class="card">
+      <h2>我的策略 <b id="lb-mine-count"></b></h2>
+      <div id="lb-mine"></div>
+      <div class="lab-hint">
+        保存后会自动出现在「今日信号」「策略回测」「模拟盘」的策略下拉里，命令行也一样认。
+        策略存在本地库（<code>user_strategies</code> 表）里，不在 .py 文件里。
+      </div>
+    </div>
+    <div class="card">
+      <h2>内置策略 <b>公开代码，可直接抄</b></h2>
+      <div id="lb-builtin"></div>
+      <div class="lab-hint">
+        「看代码」是实时读 <code>stack/strategies/builtin.py</code>，不是存下来的副本——
+        所以看到的和实际跑的永远一致。
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>编辑器 <b id="lb-editor-title" class="dim"></b></h2>
+    <div class="row">
+      <label>标识<input id="lb-name" placeholder="my_ma_cross" maxlength="32"
+        title="注册名：小写字母/数字/下划线，字母开头。不能和内置策略同名——同名会把内置策略顶掉"></label>
+      <label>名称<input id="lb-label" placeholder="界面上显示的名字"></label>
+      <label style="flex:1;min-width:220px">说明<input id="lb-desc" placeholder="一句话说明这个策略在干什么"></label>
+      <label class="cb" title="标识已存在时勾上它才会覆盖，否则会被拦住">
+        <input type="checkbox" id="lb-overwrite">覆盖已有</label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="go" id="lb-check">检查代码</button>
+      <button class="go" id="lb-save">保存</button>
+      <button class="mini" id="lb-clear">清空重写</button>
+      <span class="dim" id="lb-status"></span>
+    </div>
+    <textarea id="lb-code" class="code-edit" spellcheck="false"
+      placeholder="在这里写策略代码。左边挑一个内置策略点「以此为模板」是最快的起手方式。"></textarea>
+    <div class="params" id="lb-params"></div>
+    <div class="lab-hint">
+      快捷键：<code>Ctrl+S</code> 保存，<code>Ctrl+Enter</code> 检查，<code>Tab</code> 缩进 4 空格。<br>
+      指标列由 <code>df</code> 提供，见 <code>indicators.add_common</code>：
+      <code>ma5/10/20/60/120</code>、<code>vol_ratio</code>、<code>rsi14</code>、<code>atr14</code>、
+      <code>high20</code>、<code>mom20/60/120</code>、<code>vol20</code> 等。<br>
+      ⚠ 别把参数拼成列名（如 <code>df["ma" + str(n)]</code>）：只有上面这几个周期存在，
+      取别的周期要在 <code>prepare()</code> 里自己算——写错不会报错，只会让所有股票被静默跳过。
+    </div>
+    <div id="lb-report"></div>
+  </div>
+
+  <div class="card" id="lb-run-card" style="display:none">
+    <h2>试跑回测 <b id="lb-run-head" class="dim"></b></h2>
+    <div class="row">
+      <label>开始<input type="date" id="lb-start" value="2021-01-01"></label>
+      <label>结束<input type="date" id="lb-end"></label>
+      <label>初始资金<input type="number" id="lb-cash" value="200000" step="10000"></label>
+      <label>最大持仓<input type="number" id="lb-maxpos" value="5" min="1" max="50"></label>
+      <label>池上限<input type="number" id="lb-top" value="800" min="10" step="100"></label>
+      <button class="go" id="lb-run">试跑（用编辑器里的代码）</button>
+      <button class="mini" id="lb-save-run">先保存再试跑</button>
+    </div>
+    <div class="lab-hint">
+      跑的是编辑器里<b>当前这份</b>代码，没保存也能跑（会先体检一遍，不通过直接拒绝）。
+      股票池沿用「股票池」页的过滤条件。
+    </div>
+    <div id="lb-run-out"></div>
+  </div>
 </section>
 
 <!-- ============================================ 持仓 -->
@@ -384,6 +480,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   $('#p-'+b.dataset.p).classList.add('on');
   // 切回回测页时画布刚从 display:none 变可见，尺寸可能已经变了，重画一次
   if (b.dataset.p==='backtest') setTimeout(redrawAll, 60);
+  if (b.dataset.p==='strategy') loadLab();
   if (b.dataset.p==='positions') loadPositions();
   if (b.dataset.p==='paper')     loadPaper();
   if (b.dataset.p==='replay') setTimeout(renderReplay, 60);
@@ -418,18 +515,34 @@ async function loadStatus(){
 /* ---------------------------------------------------- 策略下拉 */
 async function loadStrategies(){
   STRATS = await api('/api/strategies');
-  const opts = STRATS.map(s=>`<option value="${s.name}">${esc(s.label)}</option>`).join('');
-  $('#sg-strategy').innerHTML = opts;
-  $('#bt-strategy').innerHTML = opts;
-  $('#pp-strategy').innerHTML = opts;
+  // 自己的策略单独归一组。全部塞一个下拉里时，内置 8 个 + 自己的十几个
+  // 混在一起，找谁都费劲。
+  const opt = s => `<option value="${s.name}">${esc(s.label)}</option>`;
+  const mine = STRATS.filter(s => s.origin === 'user');
+  const built = STRATS.filter(s => s.origin !== 'user');
+  const groups = built.map(opt).join('')
+    + (mine.length ? `<optgroup label="我的策略">${mine.map(opt).join('')}</optgroup>` : '');
+  $('#sg-strategy').innerHTML = groups;
+  $('#bt-strategy').innerHTML = groups;
+  $('#pp-strategy').innerHTML = groups;
   bindStrategy('sg'); bindStrategy('bt'); bindStrategy('pp');
+  renderLabLists();
 }
 
 /* 参数编辑器：完全由策略自己声明的 defaults / param_meta 驱动，
-   新增策略不用改这里的任何一行。 */
+   新增策略不用改这里的任何一行。
+
+   策略实验室（prefix='lb'）用的是**体检报告里**那份声明（还没保存的代码也一样
+   有 defaults/param_meta），所以这里统一从 describe() 取。 */
+function describe(prefix){
+  if(prefix === 'lb') return LB.desc;
+  return STRATS.find(x => x.name === $('#'+prefix+'-strategy').value);
+}
+
 function renderParams(prefix){
-  const s = STRATS.find(x=>x.name===$('#'+prefix+'-strategy').value);
+  const s = describe(prefix);
   const box = $('#'+prefix+'-params');
+  if(!box) return;
   if(!s || !Object.keys(s.defaults||{}).length){ box.innerHTML=''; return; }
   const meta = s.param_meta || {};
   let h = '<div class="ptitle">策略参数</div>';
@@ -1330,10 +1443,360 @@ async function refreshSaves(){try{const rows=await api('/api/replay/saves');$('#
 $('#rp-save').onclick=async()=>{const user=$('#rp-user').value.trim();if(!user)return alert('请输入用户名');try{const state={...replay,timer:null,settings:{ma:$('#rp-ma').value,ind1:$('#rp-ind1').value,ind2:$('#rp-ind2').value}};await post('/api/replay/saves',{user_name:user,state});$('#rp-save-status').textContent='已保存';refreshSaves()}catch(e){alert(e.message)}};
 $('#rp-load-save').onclick=async()=>{const user=$('#rp-saves').value||$('#rp-user').value.trim();if(!user)return alert('请选择或输入用户名');try{const r=await api('/api/replay/saves/'+encodeURIComponent(user)),s=r.state;replayStop();Object.assign(replay,s,{timer:null});$('#rp-user').value=user;$('#rp-code').value=replay.code||'';$('#rp-ma').value=s.settings?.ma||'5,10,20';$('#rp-ind1').value=s.settings?.ind1||'macd';$('#rp-ind2').value=s.settings?.ind2||'rsi';$('#rp-title').textContent=`${replay.code} ${replay.name} · 已恢复 ${r.updated_at}`;['#rp-start-btn','#rp-buy','#rp-sell','#rp-next','#rp-save'].forEach(x=>$(x).disabled=false);renderReplay()}catch(e){alert(e.message)}}; refreshSaves();
 
+/* ---------------------------------------------------- 策略实验室
+   网页上写策略、当场跑。代码存在库里（user_strategies 表），保存时动态编译进
+   和内置策略同一个注册表，所以回测/信号/模拟盘/命令行都自动认得。
+
+   编辑器里那份代码可以**先不保存就试跑**：/api/backtest 支持带 code 参数，
+   跑之前先做一遍和保存相同的体检——带前视偏差的代码跑出来的绩效是假的，
+   宁可直接拒掉。 */
+let LB = {desc: null, savedCode: null, savedName: '', paramKeys: null};
+
+async function loadLab(){
+  if(!$('#lb-end').value) $('#lb-end').value = $('#bt-end').value || today;
+  if(!$('#lb-code').value) lbTemplate('ma_cross');   // 空编辑器给个起手模板
+  await loadStrategies();
+}
+
+function renderLabLists(){
+  const mine = STRATS.filter(s => s.origin === 'user');
+  const built = STRATS.filter(s => s.origin !== 'user');
+  $('#lb-mine-count').textContent = mine.length ? `共 ${mine.length} 个` : '';
+
+  $('#lb-mine').innerHTML = mine.length
+    ? `<div class="scroll"><table><thead><tr><th>标识</th><th>名称</th>
+        <th class="num">行数</th><th>最后修改</th><th></th></tr></thead><tbody>`
+      + mine.map(s=>`<tr><td class="code">${esc(s.name)}</td>
+          <td>${esc(s.label)}${s.load_error
+            ? `<br><span class="warntx">加载失败：${esc(s.load_error)}</span>`
+            : `<br><span class="dim" style="font-size:12px">${esc((s.description||'').slice(0,60))}</span>`}</td>
+          <td class="num dim">${s.lines ?? '—'}</td>
+          <td class="dim">${esc(s.updated_at || '—')}</td>
+          <td><button class="mini" onclick="lbOpen('${esc(s.name)}')">编辑</button>
+              <button class="mini" onclick="lbBacktestSaved('${esc(s.name)}')">回测</button>
+              <button class="mini" onclick="lbDelete('${esc(s.name)}')">删除</button></td>
+        </tr>`).join('') + `</tbody></table></div>`
+    : `<div class="dim">还没有自己的策略。右边挑一个内置策略点「以此为模板」改一份，
+       或点「清空重写」从零开始。</div>`;
+
+  $('#lb-builtin').innerHTML =
+    `<div class="scroll"><table><thead><tr><th>标识</th><th>名称</th><th></th>
+      </tr></thead><tbody>`
+    + built.map(s=>`<tr><td class="code">${esc(s.name)}</td>
+        <td>${esc(s.label)}</td>
+        <td style="white-space:nowrap">
+          <button class="mini" onclick="lbView('${esc(s.name)}')">看代码</button>
+          <button class="mini" onclick="lbTemplate('${esc(s.name)}')">以此为模板</button>
+        </td></tr>`).join('')
+    + `</tbody></table></div>`;
+}
+
+/* 编辑器状态：行数 + 是否改过没保存。改过没保存这件事必须在界面上看得见——
+   否则「跑出来的结果和刚才不一样」会让人怀疑回测引擎。 */
+function lbSyncStatus(){
+  const code = $('#lb-code').value;
+  const dirty = LB.savedCode !== null && code !== LB.savedCode;
+  const n = code ? code.split('\n').length : 0;
+  const parts = [`${n} 行`];
+  if(!code) parts.push('空');
+  else if(LB.savedName && !dirty) parts.push(`已保存：${LB.savedName}`);
+  else parts.push(dirty ? '有未保存的改动' : '未保存');
+  $('#lb-status').textContent = parts.join(' · ');
+  $('#lb-editor-title').textContent = LB.savedName
+    ? `${LB.savedName}` : (code ? '新策略' : '');
+}
+
+/* 体检报告。失败时把出错那一行也贴出来——只给行号还要自己去数。 */
+function lbShowReport(rep, isSave){
+  const ta = $('#lb-code');
+  ta.classList.toggle('bad', !rep.ok);
+  if(rep.ok){
+    $('#lb-report').innerHTML =
+      `<div class="card" style="border-left:3px solid var(--down);padding:12px 14px">
+        <b>检查通过</b> <span class="dim">— ${(rep.checks||[]).map(esc).join(' · ')}</span>
+        ${(rep.notes||[]).map(nt=>`<div class="note">· ${esc(nt)}</div>`).join('')}
+      </div>`;
+    return;
+  }
+  const src = ta.value.split('\n');
+  const line = rep.line ? `<b>第 ${rep.line} 行</b>：` : '';
+  const shown = (rep.line && src[rep.line-1] !== undefined)
+    ? `<pre class="code-err">${String(rep.line).padStart(4)} | ${esc(src[rep.line-1])}</pre>`
+    : '';
+  $('#lb-report').innerHTML =
+    `<div class="err" style="margin-top:10px">
+       <b>${isSave ? '没有保存' : '检查未通过'}</b>
+       ${rep.exists ? '（这份标识已经存在，要覆盖就勾上「覆盖已有」）' : ''}
+     </div>
+     <div class="err" style="margin-top:6px">${line}</div>${shown}
+     <div class="err" style="margin-top:6px;white-space:pre-wrap">${esc(rep.error || '')}</div>
+     ${(rep.notes||[]).map(nt=>`<div class="note">· ${esc(nt)}</div>`).join('')}`;
+}
+
+/* ---------------- 实验室：检查 / 保存 / 模板 ---------------- */
+function lbPayload(){
+  return {
+    name: $('#lb-name').value.trim(),
+    label: $('#lb-label').value.trim(),
+    description: $('#lb-desc').value.trim(),
+    code: $('#lb-code').value,
+    overwrite: $('#lb-overwrite').checked,
+    params: collectParams('lb'),
+  };
+}
+
+/* 体检通过后摆出参数编辑器。参数面板由策略自己声明，必须等体检报告回来才知道
+   有哪些参数；但只在**参数集合变化时**重建，否则会把用户刚改的值冲回默认值。 */
+function lbSetupParams(rep){
+  const keys = Object.keys(rep.defaults || {}).join(',');
+  if(LB.paramKeys !== keys){
+    LB.paramKeys = keys;
+    renderParams('lb');
+  }
+  LB.desc = {defaults: rep.defaults || {}, param_meta: rep.param_meta || {}};
+}
+
+async function lbCheck(){
+  const btn = $('#lb-check'); btn.disabled = true;
+  try{
+    const rep = await post('/api/strategies/check', lbPayload());
+    lbShowReport(rep, false);
+    if(rep.ok) lbSetupParams(rep);
+    return rep;
+  }catch(e){
+    $('#lb-report').innerHTML =
+      `<div class="err" style="margin-top:10px">${esc(e.message)}</div>`;
+    return {ok: false};
+  }finally{ btn.disabled = false; }
+}
+
+async function lbSave(){
+  const btn = $('#lb-save'); btn.disabled = true;
+  try{
+    const rep = await post('/api/strategies/save', lbPayload());
+    lbShowReport(rep, true);
+    if(rep.ok && rep.saved){
+      LB.savedCode = $('#lb-code').value; LB.savedName = rep.name;
+      $('#lb-name').value = rep.name;
+      if(!$('#lb-label').value) $('#lb-label').value = rep.label || '';
+      if(!$('#lb-desc').value)  $('#lb-desc').value  = rep.description || '';
+      $('#lb-overwrite').checked = false;
+      lbSetupParams(rep);
+      await loadStrategies();            // 下拉与两个列表都要刷新
+      lbSyncStatus();
+    }else if(rep.exists){
+      // 顺手勾上，再点一次「保存」就是覆盖，省得用户去找那个复选框
+      $('#lb-overwrite').checked = true;
+    }
+    return rep;
+  }catch(e){
+    $('#lb-report').innerHTML =
+      `<div class="err" style="margin-top:10px">${esc(e.message)}</div>`;
+  }finally{ btn.disabled = false; }
+}
+
+/* 把源码复制过来当模板。名字先给个 name_copy，重名时保存会被拦住，改标识即可。 */
+window.lbTemplate = async name => {
+  try{
+    const src = await api('/api/strategies/'+encodeURIComponent(name)+'/code');
+    $('#lb-code').value = src.code;
+    $('#lb-name').value = name + '_copy';
+    $('#lb-label').value = (src.label || name) + '（副本）';
+    $('#lb-desc').value = src.description || '';
+    LB.savedCode = null; LB.savedName = ''; LB.paramKeys = null; LB.desc = null;
+    renderParams('lb');
+    $('#lb-report').innerHTML =
+      `<div class="card" style="border-left:3px solid var(--accent);padding:12px 14px">
+        已把「${esc(src.label || name)}」的代码放进编辑器
+        ${src.origin === 'builtin' ? `（实时读自 ${esc(src.file || '源码文件')}）` : ''}。
+        改完点「检查代码」，没问题再「保存」。<br>
+        <span class="dim">代码里写的标识会被上面填的「标识」覆盖，所以不会顶掉原策略。</span>
+      </div>`;
+    lbSyncStatus();
+  }catch(e){ alert(e.message); }
+};
+
+/* 只读查看源码。内置策略的代码在这里公开可见（实时读 .py 文件，不是副本）。 */
+window.lbView = async name => {
+  try{
+    const src = await api('/api/strategies/'+encodeURIComponent(name)+'/code');
+    $('#lb-report').innerHTML =
+      `<div class="card" style="padding:12px 14px">
+        <b>${esc(src.label || name)}</b>
+        <span class="tag">${src.origin === 'builtin' ? '内置' : '我的'}</span>
+        ${src.file ? `<span class="tag">${esc(src.file)}:${src.line}</span>` : ''}
+        <span class="dim">— ${esc(src.note || '')}</span>
+        <div class="row" style="margin-top:8px">
+          <button class="mini" onclick="lbTemplate('${esc(name)}')">复制到编辑器改一份</button>
+        </div>
+        <pre class="code-view">${esc(src.code)}</pre>
+      </div>`;
+  }catch(e){ alert(e.message); }
+};
+
+/* 载入自己的策略继续改。顺便体检一次：参数面板要等体检报告才知道长什么样。 */
+window.lbOpen = async name => {
+  try{
+    const src = await api('/api/strategies/'+encodeURIComponent(name)+'/code');
+    $('#lb-code').value = src.code;
+    $('#lb-name').value = name;
+    $('#lb-label').value = src.label || '';
+    $('#lb-desc').value = src.description || '';
+    $('#lb-run-card').style.display = 'block';
+    LB.savedCode = src.code; LB.savedName = name; LB.paramKeys = null; LB.desc = null;
+    renderParams('lb');
+    lbSyncStatus();
+    if(src.load_error){
+      $('#lb-report').innerHTML = `<div class="err" style="margin-top:10px">
+        这份代码当前<b>加载失败</b>，修好再保存：<br>${esc(src.load_error)}</div>`;
+    }else{
+      await lbCheck();
+    }
+  }catch(e){ alert(e.message); }
+};
+
+window.lbDelete = async name => {
+  if(!confirm(`删除自定义策略 ${name}？\n\n如果模拟盘账户正在用它，会被拦住——`
+              + `前向记录断了补不回来。`)) return;
+  try{
+    const r = await api('/api/strategies/'+encodeURIComponent(name), {method:'DELETE'});
+    if(!r.ok){ alert(r.error || '删除失败'); return; }
+    if(LB.savedName === name){ LB.savedCode = null; LB.savedName = ''; lbSyncStatus(); }
+    await loadStrategies();
+  }catch(e){ alert(e.message); }
+};
+
+/* 跳到「策略回测」页用它跑：完整报告（净值/回撤/月度热力图/逐笔明细）在那边。 */
+window.lbBacktestSaved = name => {
+  document.querySelector('nav button[data-p="backtest"]').click();
+  const sel = $('#bt-strategy');
+  sel.value = name;
+  if(sel.value === name) sel.onchange();
+  else alert('下拉里没有这个策略，可能是刚被删掉了');
+};
+
+/* ---------------- 实验室：试跑回测 ---------------- */
+async function lbRun(){
+  const btn = $('#lb-run'); btn.disabled = true;
+  $('#lb-run-card').style.display = 'block';
+  $('#lb-run-out').innerHTML = '<div class="card"><span class="spin"></span> 正在跑回测…</div>';
+  try{
+    const r = await post('/api/backtest', {
+      strategy: $('#lb-name').value.trim() || 'custom',
+      code: $('#lb-code').value,          // 没保存也能跑；后端会先体检再跑
+      start: $('#lb-start').value, end: $('#lb-end').value,
+      initial_cash: +$('#lb-cash').value, max_positions: +$('#lb-maxpos').value,
+      top: +$('#lb-top').value, params: collectParams('lb'),
+      universe: universeReq(),
+    });
+    renderLabRun(r);
+  }catch(e){
+    $('#lb-run-out').innerHTML = `<div class="err" style="white-space:pre-wrap">${esc(e.message)}</div>`;
+    $('#lb-run-head').textContent = '';
+  }finally{ btn.disabled = false; }
+}
+
+/* 试跑结果：够判断「这策略值不值得再细看」就行——完整报告在回测页。 */
+function renderLabRun(r){
+  const m = r.metrics || {};
+  if(m.error){
+    $('#lb-run-out').innerHTML = `<div class="err" style="white-space:pre-wrap">${esc(m.error)}</div>`;
+    $('#lb-run-head').textContent = '';
+    return;
+  }
+  const kpi = (k,v,c)=>`<div class="kpi"><div class="k">${k}</div>
+    <div class="v ${c||''}">${v}</div></div>`;
+  const cc = r.code_check;
+
+  let h = (r.warnings||[]).map(w=>
+    `<div class="card" style="border-left:3px solid var(--warn);padding:10px 14px">
+      <b>结果可信度</b> <span class="dim">— ${esc(w)}</span></div>`).join('');
+  if(cc) h += `<div class="card" style="padding:10px 14px">
+      <b>代码体检</b> <span class="dim">— ${(cc.checks||[]).map(esc).join(' · ')}</span>
+      ${(cc.notes||[]).map(nt=>`<div class="note">· ${esc(nt)}</div>`).join('')}</div>`;
+
+  h += `<div class="card">
+    <h2>绩效总览 <b>${esc(r.strategy)}</b>
+      <span class="dim" style="font-weight:400;text-transform:none;letter-spacing:0">
+      ${r.start} ~ ${r.end} · 股票池 ${r.universe_size} 只 · 参数
+      ${esc(JSON.stringify(r.params||{}))}</span></h2>
+    <div class="grid">
+      ${kpi('总收益', spct(m.total_return), cls(m.total_return))}
+      ${kpi('年化收益', spct(m.cagr), cls(m.cagr))}
+      ${kpi('沪深300', spct(m.benchmark_return), cls(m.benchmark_return))}
+      ${kpi('超额收益', spct(m.excess_return), cls(m.excess_return))}
+      ${kpi('最大回撤', pct(m.max_drawdown), 'down')}
+      ${kpi('夏普', num(m.sharpe), cls(m.sharpe))}
+      ${kpi('交易笔数', m.trades ?? 0)}
+      ${kpi('胜率', pct(m.win_rate,1))}
+    </div>
+    <div class="note">这只是试跑：完整报告（净值、回撤曲线、月度热力图、逐笔成交）
+      在「策略回测」页。单次回测说明不了什么——改参数多跑几组，再看哪段周期站得住。</div></div>`;
+
+  if((r.equity?.dates||[]).length)
+    h += `<div class="card"><h2>净值曲线</h2><canvas id="lb-eq"></canvas>
+      <div class="legend"><span><i style="background:var(--accent)"></i>策略</span>
+      <span><i style="background:var(--dim)"></i>沪深300</span></div></div>`;
+
+  const T = (r.trades || []).slice(-20).reverse();
+  if(T.length)
+    h += `<div class="card"><h2>最近成交 <b>${T.length} / 共 ${(r.trades||[]).length} 笔</b></h2>
+      <div class="scroll"><table><thead><tr><th>代码</th><th>名称</th><th>买入</th>
+      <th>卖出</th><th class="num">持有</th><th class="num">收益率</th><th>卖出原因</th>
+      </tr></thead><tbody>` + T.map(t=>`<tr><td class="code">${t.code}</td>
+        <td>${esc(t.name)}</td><td class="dim">${t.open_date}</td>
+        <td class="dim">${t.close_date}</td><td class="num">${t.hold_days}日</td>
+        <td class="num ${cls(t.pnl_pct)}">${spct(t.pnl_pct)}</td>
+        <td class="reason">${esc(t.close_reason)}</td></tr>`).join('')
+      + `</tbody></table></div></div>`;
+
+  $('#lb-run-out').innerHTML = h;
+  $('#lb-run-head').textContent = `${m.trades ?? 0} 笔交易 · ${spct(m.total_return)}`;
+  // 画布要等容器可见、拿到宽度之后再画，否则 clientWidth 是 0，图会是空的
+  if((r.equity?.dates||[]).length)
+    setTimeout(() => chart('#lb-eq', {dates: r.equity.dates,
+      fmtY: v => (v/10000).toFixed(1)+'万', series: [
+        {data: r.equity.benchmark, color: css('--dim'), width: 1.2},
+        {data: r.equity.value, color: css('--accent'), width: 1.8},
+      ]}), 60);
+}
+
+/* ---------------- 实验室：编辑器绑定 ---------------- */
+const lbCodeEl = $('#lb-code');
+lbCodeEl.addEventListener('keydown', e => {
+  if(e.key === 'Tab'){
+    // 统一插 4 空格。Python 里 Tab 与空格混用是 SyntaxError 的常见来源，
+    // 从别处粘过来的代码尤其容易踩。
+    e.preventDefault();
+    lbCodeEl.setRangeText('    ', lbCodeEl.selectionStart, lbCodeEl.selectionEnd, 'end');
+    lbSyncStatus();
+  }else if((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's'){
+    e.preventDefault(); lbSave();
+  }else if((e.ctrlKey || e.metaKey) && e.key === 'Enter'){
+    e.preventDefault(); lbCheck();
+  }
+});
+lbCodeEl.addEventListener('input', lbSyncStatus);
+$('#lb-check').onclick = () => lbCheck();
+$('#lb-save').onclick  = () => lbSave();
+$('#lb-run').onclick   = () => lbRun();
+$('#lb-save-run').onclick = async () => { const rep = await lbSave(); if(rep && rep.ok) lbRun(); };
+$('#lb-clear').onclick = () => {
+  if(!confirm('清空编辑器？未保存的代码会丢失。')) return;
+  ['#lb-name','#lb-label','#lb-desc','#lb-code'].forEach(s => $(s).value = '');
+  LB.savedCode = null; LB.savedName = ''; LB.paramKeys = null; LB.desc = null;
+  renderParams('lb');
+  $('#lb-report').innerHTML = '';
+  $('#lb-run-card').style.display = 'none';
+  $('#lb-run-out').innerHTML = '';
+  lbSyncStatus();
+};
+
 /* ---------------------------------------------------- 启动 */
 const today = new Date().toISOString().slice(0,10);
 // 先用今天占位，loadStatus 拿到库内最后一个完整交易日后再校正（见 loadStatus）
 $('#bt-end').value = today; $('#ps-date').value = today;
+$('#lb-end').value = today;             // 策略实验室的试跑结束日，同样会被校正
 $('#rp-end').value=today; $('#rp-start').value='2021-01-01'; loadReplayStocks();
 loadStatus(); loadStrategies(); pollSync();
 </script>

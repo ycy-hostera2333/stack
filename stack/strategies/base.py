@@ -134,6 +134,9 @@ class Strategy:
             "description": cls.description,
             "defaults": cls.defaults,
             "param_meta": getattr(cls, "param_meta", {}),
+            # builtin / user：界面要分开展示（内置的是「公开代码」示例，
+            # 自定义的是自己写的）。ad_hoc 不会进注册表，只为完整起见。
+            "origin": getattr(cls, "origin", "builtin"),
         }
 
 
@@ -167,13 +170,25 @@ def blend_score_fields(values: dict[str, dict[str, float]],
     return {c: float(total[c]) for c in codes}
 
 
+def _ensure_user_strategies() -> None:
+    """把库里保存的自定义策略编译进 REGISTRY（只做一次）。
+
+    挂在 get_strategy/all_strategies 上，而不是模块导入时执行：导入发生得比
+    建库早（cli.py 的 import 在 init_db() 之前），那时表还不存在。
+    """
+    from . import user
+    user.ensure_loaded()
+
+
 def get_strategy(name: str, **params) -> Strategy:
+    _ensure_user_strategies()
     if name not in REGISTRY:
         raise KeyError(f"未知策略 {name!r}，可用：{sorted(REGISTRY)}")
     return REGISTRY[name](**params)
 
 
 def all_strategies() -> list[dict]:
+    _ensure_user_strategies()
     return [cls.info() for cls in REGISTRY.values()]
 
 

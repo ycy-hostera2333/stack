@@ -664,6 +664,98 @@ def _t_sync_behind():
             f"省掉 {saved} 次请求")
 
 
+@check("自定义策略：网页保存的代码进注册表，四类静默错误都能被拦下")
+def _t_user_strategy():
+    """网页上的策略实验室与内置策略走同一个 REGISTRY。
+
+    这里验证的是四类「在回测里静默」的错误确实被保存前的体检拦住：
+    语法/运行错误（引擎吞异常）、前视偏差（收益凭空变好）、返回裸数组
+    （模拟盘 .loc 静默跳过）、复制内置源码时同名顶掉内置。
+    """
+    from .strategies import REGISTRY, user as um
+
+    good = '''
+class SelftestLab(Strategy):
+    name = "selftest_lab_declared"
+    label = "自检用"
+    description = "自检"
+    defaults = {"n": 20}
+
+    def entry(self, df):
+        return safe((df["close"] > df[f"ma{self.params['n']}"]) & (df["rsi14"] < 70))
+
+    def exit(self, df):
+        return cross_below(df["close"], df[f"ma{self.params['n']}"])
+'''
+    lookahead = good.replace('df[f"ma{self.params[\'n\']}"])',
+                             'df[f"ma{self.params[\'n\']}"].shift(-1))')
+    bad_syntax = "class Bad(Strategy):\n    def entry(self, df)\n        pass\n"
+    bad_array = good.replace(
+        'return safe((df["close"] > df[f"ma{self.params[\'n\']}"]) & (df["rsi14"] < 70))',
+        'return np.asarray((df["close"] > df[f"ma{self.params[\'n\']}"]) & (df["rsi14"] < 70))')
+    assert "np.asarray" in bad_array, "测试数据没替换成功"
+
+    name, tpl = "selftest_lab", "selftest_lab_tpl"
+    store.init_db()          # 单独跑这一项时（不走 run_all）也要有表
+    try:
+        # 保存 → 注册表 → 参数可调
+        rep = um.save(name, "自检用", "", good)
+        assert rep["ok"] and rep["saved"], rep
+        st = get_strategy(name, n=60)
+        assert st.params["n"] == 60 and getattr(st, "origin", "") == "user", st.params
+
+        # 复制内置源码（含 @register）不能顶掉内置策略
+        before = REGISTRY["ma_cross"]
+        src = um.source_of("ma_cross")
+        assert src and src["origin"] == "builtin", src
+        rep2 = um.save(tpl, "", "", src["code"])
+        assert rep2["ok"], rep2
+        assert REGISTRY["ma_cross"] is before, "内置策略被同名副本顶掉了"
+        assert um.builtin_names() <= {s["name"] for s in
+                                      all_strategies() if s["origin"] == "builtin"}
+
+        # 语法错误必须带行号
+        r = um.validate(bad_syntax, "selftest_bad")
+        assert not r["ok"] and r["line"] == 2, r
+
+        # 前视偏差必须被检出（shift(-1) 只会让回测变好看）
+        r = um.validate(lookahead, "selftest_look")
+        assert not r["ok"] and "未来数据" in r["error"], r
+
+        # 返回裸数组：回测照跑，模拟盘会静默跳过——必须拦住
+        r = um.validate(bad_array, "selftest_arr")
+        assert not r["ok"] and "Series" in r["error"], r
+
+        # 与内置重名要拒绝
+        r = um.validate(good, "ma_cross")
+        assert not r["ok"] and "内置策略的名字" in r["error"], r
+
+        # 参数被拼进列名：只按默认值体检会漏掉（n=20 恰好存在，n=30 不存在）
+        r = um.validate(good, name, {"n": 30})
+        assert not r["ok"] and "ma30" in r["error"], r
+        r = um.validate(good, name, {"n": 60})
+        assert r["ok"], r
+
+        # 引擎对空面板不再一律报「请先同步行情」
+        days = store.trading_days()
+        if len(days) > 300:
+            uni = universe.build(as_of=days[-300])
+            codes = uni["code"].tolist()[:30]
+            r2 = engine.run(get_strategy(name, n=30), codes,
+                            days[-300], days[-100],
+                            engine.BacktestConfig(max_positions=3),
+                            dict(zip(uni["code"], uni["name"])))
+            assert "error" in r2.metrics and "算不出来" in r2.metrics["error"], r2.metrics
+    finally:
+        # 清理失败不能掩盖上面真正的断言失败
+        for n in (name, tpl):
+            try:
+                um.remove(n)
+            except Exception:
+                pass
+    return "进注册表、副本不顶掉内置、行号/前视/返回值/参数四类都拦得住"
+
+
 @check("打分：打分型策略在模拟盘与每日信号里都必须真正打分")
 def _t_score_spread():
     """score_fields 类策略的 score() 是占位符，真正的横截面合成要在

@@ -116,7 +116,14 @@ class Panel:
 
 
 def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
-                   warmup_days: int, dates: list[str]) -> Panel | None:
+                   warmup_days: int, dates: list[str],
+                   diag: dict | None = None) -> Panel | None:
+    """把全市场行情整理成 (股票 × 日期) 面板。
+
+    diag 用于记录"为什么没有可用股票"：这只股票是被跳过还是数据太短。
+    没有它的话，面板为空时只能报「请先同步行情」——数据明明在，人却查不出来
+    到底哪里错了。
+    """
     # 预热窗口取"配置值"和"策略自称所需"的较大者。参数可调的策略（如双均线把慢线
     # 设到 250）需要的历史比默认值长得多，喂不够会静默跑不出信号。
     # 250 个交易日约合 365 个自然日，故按 1.5 倍换算并留出停牌余量。
@@ -140,13 +147,20 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
     for code, g in raw.groupby("code", sort=False):
         g = store.usable_history(g.sort_values("date"))
         if len(g) < 60:                       # 数据太短，指标算不出来
+            if diag is not None:
+                diag["short"] += 1
             continue
         try:
             d = strategy.prepare(g)
             entry = np.asarray(strategy.entry(d), dtype=bool)
             exit_ = np.asarray(strategy.exit(d), dtype=bool)
             score = np.asarray(strategy.score(d), dtype=np.float32)
-        except Exception:
+        except Exception as e:
+            # 静默跳过：策略自己写错列名时，在这里只会表现为「没有信号」。
+            # 计数留给上层，好在整个面板为空时能说清是哪种情况。
+            if diag is not None:
+                diag["errors"] += 1
+                diag["first"] = diag["first"] or f"{type(e).__name__}: {e}"
             continue
 
         # 只保留落在回测区间内的行，映射到全局日期轴
@@ -154,6 +168,8 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
         pos = np.array([date_pos.get(x, -1) for x in ds])
         sel = pos >= 0
         if not sel.any():
+            if diag is not None:
+                diag["norows"] += 1
             continue
         pos = pos[sel]
 
@@ -209,6 +225,26 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
         arrays["score"][~arrays["valid"]] = -9.9
 
     return Panel(keep_codes, dates, arrays)
+
+
+def _panel_error(diag: dict) -> str:
+    """面板为空的原因。原来一律报「请先同步行情」，但数据在的时候原因另有其他：
+    策略在 prepare/entry 里抛异常（最典型的是把参数拼进不存在的指标列名，
+    比如 ma{n} 而 add_common 只提供 5/10/20/60/120），引擎是静默跳过的。
+    这时报「请先同步行情」会让人去查数据，查不出任何问题。
+    """
+    if diag.get("errors"):
+        return (f"{diag['errors']} 只股票的信号全部算不出来（首个异常："
+                f"{diag['first']}）。策略在 prepare/entry 里抛了异常，"
+                "而引擎是静默跳过的。\n"
+                "常见原因：参数被拼进了不存在的指标列名——add_common 只提供 "
+                "ma5/10/20/60/120、rsi14、atr14、vol_ratio、mom20/60/120 等；"
+                "想用别的周期就自己在 prepare() 里算，例如 "
+                "df[\"ma_n\"] = ind.sma(df[\"close\"], self.params[\"n\"])")
+    if diag.get("short"):
+        return (f"所选区间内每只股票的 K 线都不足 60 根（{diag['short']} 只），"
+                "算不出指标。往更早的区间回测，或先同步行情。")
+    return "所选区间内没有可用数据，请先同步行情"
 
 
 def _cross_rank(mat: np.ndarray, valid: np.ndarray) -> np.ndarray:
@@ -293,9 +329,13 @@ def run(strategy: Strategy, codes: list[str], start: str, end: str,
             f"最后这段的净值是冻住的，不作数。先跑 sync --daily，"
             f"或把结束日设到 {complete}。")
 
-    P = _prepare_panel(strategy, codes, start, end, cfg.warmup_days, dates)
+    diag = {"short": 0, "errors": 0, "norows": 0, "first": None}
+    P = _prepare_panel(strategy, codes, start, end, cfg.warmup_days, dates, diag)
     if P is None:
-        result.metrics = {"error": "所选区间内没有可用数据，请先同步行情"}
+        # 数据源本身没数据时 diag 全是 0，保持原来那句话
+        result.metrics = {"error": "所选区间内没有可用数据，请先同步行情"
+                          if not any(diag[k] for k in ("short", "errors", "norows"))
+                          else _panel_error(diag)}
         return result
 
     # 涨跌停幅度只和代码、是否 ST 有关，预先算好，免得在内层循环里反复判断

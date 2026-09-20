@@ -67,8 +67,25 @@ class UniverseReq(BaseModel):
         return universe.UniverseFilter(**self.model_dump())
 
 
+class StrategyCodeReq(BaseModel):
+    """自定义策略的代码。name 是标识（注册名），label/description 给界面看。"""
+    name: str = ""
+    label: str = ""
+    description: str = ""
+    code: str = ""
+    overwrite: bool = False
+    # 编辑器里当前填的参数。体检要用它们，而不是代码里的默认值：
+    # 参数被拼进列名时（df[f"ma{n}"]），默认值通过、真实取值却会静默跳过全部股票。
+    params: dict = Field(default_factory=dict)
+
+
 class BacktestReq(BaseModel):
-    strategy: str
+    # 允许为空——只要给了 code（网页编辑器里还没保存的那份代码）
+    strategy: str = ""
+    # 编辑器里正在写的代码。传了就用它跑，不传就按 strategy 从注册表取。
+    # 这样「改一点点、立刻看结果」不需要先保存一遍，也不会在
+    # 策略下拉里留下一堆试跑的半成品。
+    code: str = ""
     start: str = "2021-01-01"
     # 默认到库内最后一个完整交易日，而不是今天——库尾残日会让最后几天冻住
     end: str = Field(default_factory=lambda: (
@@ -140,7 +157,67 @@ async def status():
 
 @app.get("/api/strategies")
 async def strategies():
-    return all_strategies()
+    """内置策略 + 自定义策略。
+
+    自定义策略要带上加载失败原因：编译不过的那份会被注册表跳过，
+    不说明的话界面上只是「列表里少了一个」，看着像没保存成功。
+    """
+    from .strategies import user as user_mod
+
+    out = all_strategies()
+    saved = {r["name"]: r for r in user_mod.saved_overview()}
+    for s in out:
+        row = saved.get(s["name"]) or {}
+        s["updated_at"] = row.get("updated_at")
+        s["lines"] = row.get("lines") if row else None
+        s["load_error"] = row.get("load_error") or user_mod.load_errors.get(s["name"])
+        s["created_at"] = row.get("created_at")
+    return _clean(out)
+
+
+@app.get("/api/strategies/{name}/code")
+async def strategy_code(name: str):
+    """策略源码：内置的实时读 .py 文件，自定义的读库。"""
+    from .strategies import user as user_mod
+
+    src = await _run(user_mod.source_of, name)
+    if not src:
+        raise HTTPException(404, f"没有找到策略 {name}")
+    return _clean(src)
+
+
+@app.post("/api/strategies/check")
+async def strategy_check(req: StrategyCodeReq):
+    """只体检不保存，给编辑器上的「检查」按钮用。
+
+    语法、运行错误、返回值格式、前视偏差四类问题都在这里指出行号——
+    它们在回测里全是静默的（引擎吞异常、未来数据只让收益变好看）。
+    """
+    from .strategies import user as user_mod
+
+    return _clean(await _run(user_mod.validate, req.code, req.name, req.params))
+
+
+@app.post("/api/strategies/save")
+async def strategy_save(req: StrategyCodeReq):
+    """保存自定义策略。
+
+    校验失败返回 HTTP 200 + ok=false，而不是 4xx：行号、失败原因这些结构化
+    信息要原样给到编辑器，而前端的 api() 包装器只从 detail 里取字符串。
+    """
+    from .strategies import user as user_mod
+
+    res = await _run(user_mod.save, req.name, req.label, req.description,
+                     req.code, req.overwrite, req.params)
+    return _clean(res)
+
+
+@app.delete("/api/strategies/{name}")
+async def strategy_delete(name: str, force: bool = False):
+    """删除自定义策略。被模拟盘账户用着时要加 force=1（前向记录断了没法补）。"""
+    from .strategies import user as user_mod
+
+    return _clean(await _run(user_mod.remove, name, force))
 
 
 @app.post("/api/universe")
@@ -205,13 +282,30 @@ async def load_replay(user_name: str):
 # ------------------------------------------------------------------ 回测
 @app.post("/api/backtest")
 async def backtest(req: BacktestReq):
-    try:
-        strat = get_strategy(req.strategy, **req.params)
-    except KeyError as e:
-        raise HTTPException(400, str(e))
-    except ValueError as e:
-        # 参数非法（如快线周期 >= 慢线周期），把原因原样告诉界面
-        raise HTTPException(400, str(e))
+    from .strategies import user as user_mod
+
+    if req.code.strip():
+        # 编辑器里的代码还没保存也能跑。先体检再跑：带前视偏差的代码跑出来的
+        # 绩效是假的，宁可直接拒掉并把原因显示在编辑器里。体检用的是
+        # **编辑器里填的那组参数**，不是代码默认值（见 user.analyze 的说明）。
+        rep = await _run(user_mod.analyze, req.code, req.strategy, False,
+                         req.params)
+        cls, report = rep
+        if not report["ok"] or cls is None:
+            raise HTTPException(400, report["error"] or "代码体检未通过")
+        try:
+            strat = await _run(user_mod.strategy_from_code, req.code,
+                               req.strategy or "custom", **req.params)
+        except user_mod.CodeError as e:
+            raise HTTPException(400, e.message)
+    else:
+        try:
+            strat = get_strategy(req.strategy, **req.params)
+        except KeyError as e:
+            raise HTTPException(400, str(e))
+        except ValueError as e:
+            # 参数非法（如快线周期 >= 慢线周期），把原因原样告诉界面
+            raise HTTPException(400, str(e))
 
     # 股票池按回测**起始日**的流动性和价格筛选，不能用 req.end：
     # 用结束日的数据选股等于拿未来信息决定当初买什么，是典型的前视偏差。
@@ -230,6 +324,15 @@ async def backtest(req: BacktestReq):
                      cfg, dict(zip(uni["code"], uni["name"])))
     payload = res.to_json()
     payload["universe_size"] = int(len(uni))
+    payload["universe_size"] = int(len(uni))
+    if req.code.strip():
+        # 把体检结论一并给界面：试跑用的是编辑器里那份代码，让人看到
+        # 「行数、无前视偏差、试跑通过」这几项都过了，比只给绩效数字可信
+        payload["code_check"] = {k: report.get(k) for k in
+                                 ("ok", "checks", "notes", "warmup_bars",
+                                  "defaults", "param_meta", "error", "line",
+                                  "label", "description", "name")}
+    return JSONResponse(_clean(payload))
     return JSONResponse(_clean(payload))
 
 

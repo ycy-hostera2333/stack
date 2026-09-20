@@ -354,11 +354,44 @@ def cmd_selftest(args) -> None:
 
 def cmd_serve(args) -> None:
     import uvicorn
+
+    # 空库不报错（界面照样能打开，只是每个页面都没数），但那样很容易被当成
+    # 程序坏了——第一次跑的人多半会说「界面能开，但什么都没显示」。
+    if not store.coverage()["bars"]:
+        print("本地库还没有行情数据：界面能打开，但所有策略、回测、信号都是空的。")
+        print("  先拉股票列表与指数基准： python -m stack.cli sync --instruments --index")
+        print("  再同步日线（首次较久，可加 --limit 300 先跑通）：")
+        print("                           python -m stack.cli sync --daily")
+        print()
+
     print(f"界面地址： http://127.0.0.1:{args.port}")
     uvicorn.run("stack.api:app", host="127.0.0.1", port=args.port, reload=args.reload)
 
 
 def main(argv=None) -> int:
+    # Windows 上 stdout/stderr 被重定向时（IDE 的运行窗口、管道、写日志），
+    # Python 用系统 locale 编码输出——这台机器是 cp1252，第一句中文 print 就
+    # 抛 UnicodeEncodeError。serve 是在绑定端口**之前**打印地址的，于是进程
+    # 直接退出，表现为「网页打不开/看不到界面」，一点 traceback 都不好找。
+    # 真控制台不受影响（Windows 上 Python 对控制台本来就用 UTF-8），
+    # 所以只改重定向的情况；errors=replace 保证任何字符都打不崩。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is None or stream.isatty():
+                continue                       # 真控制台本来就 UTF-8，别动
+            if (stream.encoding or "").lower().replace("-", "") == "utf8":
+                continue
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass                               # 流已关闭等极端情况，不影响主流程
+
+    # 建库必须挡在读库之前：新克隆下来的仓库没有 market.db，sqlite3.connect
+    # 会先建出一个空文件，紧接着下面取 --end 默认值的 last_complete_day() 查
+    # daily 就报「no such table: daily」。那是解析参数阶段的事，早于
+    # args.func(args)，于是连 sync 自己都跑不动——而唯一会建表的
+    # store.init_db() 就在 sync 里，形成死锁：越是想下数据，越是下不了。
+    store.init_db()
+
     p = argparse.ArgumentParser(prog="stack", description="A股选股与信号辅助系统")
     sub = p.add_subparsers(dest="cmd", required=True)
 

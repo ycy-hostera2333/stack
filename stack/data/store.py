@@ -85,6 +85,18 @@ CREATE TABLE IF NOT EXISTS sync_errors (
     created_at TEXT NOT NULL,
     PRIMARY KEY (code, date)
 );
+
+-- 网页上写的自定义策略。代码本身存在这里，服务启动时动态编译进策略注册表，
+-- 与内置策略走完全相同的路径（回测/信号/模拟盘/命令行都不区分）。
+-- name 既是主键，也是注册名：不能和内置策略重名，否则内置策略会被静默顶掉。
+CREATE TABLE IF NOT EXISTS user_strategies (
+    name        TEXT PRIMARY KEY,
+    label       TEXT,
+    description TEXT,
+    code        TEXT NOT NULL,
+    created_at  TEXT,
+    updated_at  TEXT
+);
 """
 
 
@@ -406,6 +418,53 @@ def load_signal_log(limit: int = 200) -> pd.DataFrame:
             "SELECT * FROM signal_log ORDER BY date DESC, strategy, action LIMIT ?",
             conn, params=[limit],
         )
+
+
+# ------------------------------------------------------------------ 自定义策略
+def list_user_strategies(with_code: bool = False) -> pd.DataFrame:
+    """网页上保存的策略列表。
+
+    默认不取代码：列表页只需要名字和行数，把每个策略的源码全读出来没有意义。
+    """
+    cols = "name, label, description, created_at, updated_at"
+    if with_code:
+        cols += ", code"
+    with connect() as conn:
+        return pd.read_sql(
+            f"SELECT {cols} FROM user_strategies ORDER BY updated_at DESC", conn)
+
+
+def load_user_strategy(name: str) -> dict | None:
+    """单个策略的完整记录（含代码）。"""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT name, label, description, code, created_at, updated_at "
+            "FROM user_strategies WHERE name=?", (name,)).fetchone()
+    if not row:
+        return None
+    keys = ("name", "label", "description", "code", "created_at", "updated_at")
+    return dict(zip(keys, row))
+
+
+def upsert_user_strategy(name: str, label: str, description: str,
+                         code: str) -> None:
+    """新增或覆盖保存。created_at 只在首次写入时落下，其余情况保持不变——
+    界面上「建于/改于」两列要能分开看。"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO user_strategies "
+            "(name,label,description,code,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
+            "label=excluded.label, description=excluded.description, "
+            "code=excluded.code, updated_at=excluded.updated_at",
+            (name, label, description, code, now, now))
+
+
+def delete_user_strategy(name: str) -> bool:
+    with connect() as conn:
+        cur = conn.execute("DELETE FROM user_strategies WHERE name=?", (name,))
+        return cur.rowcount > 0
 
 
 # ------------------------------------------------------------------ 同步失败留痕
