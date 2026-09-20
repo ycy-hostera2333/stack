@@ -1,0 +1,12 @@
+# 统一换行符。没有这个文件时，Windows 上不同人的 core.autocrlf 设置不同，
+# 会让同一份代码产生整文件级的假差异——合并朋友的版本时，21 个文件里有 15 个
+# 是纯换行符差异（engine.py 显示 +384 -384，实际一行没改），
+# 真正的改动被淹没在噪声里。
+* text=auto eol=lf
+
+# 二进制/数据文件不做转换
+*.db binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.day binary
