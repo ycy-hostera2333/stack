@@ -195,6 +195,11 @@ def _pit_wide(field: str) -> pd.DataFrame:
     w = _PIT_WIDE.get(field)
     if w is None:
         fd = _pit_long()
+        if field == "ytd_months" and not fd.empty:
+            # 派生字段：该期报告覆盖的月数（营收、利润都是年初至今累计值）。
+            # 必须跟着行走、不能按交易日推算：某公司当期缺报时 ffill 会拿到更早一期，
+            # 按日期推出来的月数就对不上（例：缺一季报时拿到的是 12 个月的年报）。
+            fd = fd.assign(ytd_months=pd.to_numeric(fd["period"].str[4:6]))
         if fd.empty or field not in fd.columns:
             w = pd.DataFrame()
         else:

@@ -454,7 +454,12 @@ class GrowthValue(Strategy):
         "更早记录的「+0.44%/20日、逐年 8/8」作废：那一次的股票池建在 as_of 早于"
         "库内最早交易日的调用上，流动性过滤被静默跳过，「前 N 只」取到的其实是"
         "代码序前 N 只。\n"
-        "**仍未经样本外验证，不构成有效性证据。**"
+        "**仍未经样本外验证，不构成有效性证据。**\n"
+        "2026-09 加两个质量开关（默认关闭，原行为不变）：剔除亏损、上年同期营收下限。"
+        "起因是当时的候选里 3/10 上半年亏损、营收 +1409% 的那只上年同期只有 0.2 亿。"
+        "两个阈值都是先验，不是回测挑出来的；是否有效只看前向模拟盘。\n"
+        "  · 开两个开关（1 / 5 亿）后回测（800 只、20 日调仓）：2019-2021 +37.1%→+82.5%，2022-2026.9 +50.3%→+62.9%，回撤不变。"
+        "但改善几乎全来自 2021 一年（+30pp），2025 反而 -12.5pp，2019/2020/2023 无差别——这两段都已被看过多次，不作为有效性证据。"
     )
     # 两个分量交给引擎做横截面百分位归一后等权相加。
     # 不能在 score() 里自己 rank——那排的是时间维度，还会用到未来数据。
@@ -468,6 +473,8 @@ class GrowthValue(Strategy):
         "w_value": 1.0,           # 权重：账面市值比
         "min_amount": 0.0,        # 额外流动性下限（元），0=沿用股票池设置
         "max_pb": 0.0,            # 市净率上限，0=不限。防止买到净资产为负的壳
+        "require_profit": 0,      # 1=剔除最新一期净利润 <=0 的：营收增长没变成利润
+        "min_rev_base": 0.0,      # 上年同期营收（年化，亿元）下限，0=不限。防低基数
     }
     param_meta = {
         "index_ma": {"label": "大盘择时均线", "min": 0, "max": 400, "step": 10,
@@ -476,6 +483,11 @@ class GrowthValue(Strategy):
         "w_value": {"label": "权重·账面市值比", "min": 0, "max": 3, "step": 0.1},
         "max_pb": {"label": "市净率上限", "min": 0, "max": 30, "step": 0.5,
                    "hint": "0=不限。设 10 可滤掉估值极端的标的"},
+        "require_profit": {"label": "剔除亏损", "min": 0, "max": 1, "step": 1,
+                           "hint": "1=最新一期净利润≤0 的不买：营收涨了但没赚到钱"},
+        "min_rev_base": {"label": "上年同期营收下限(亿,年化)", "min": 0, "max": 50,
+                         "step": 1,
+                         "hint": "0=不限。基数太小时营收同比是噪声，+1000% 往往只是从几千万涨到几亿"},
     }
 
     def warmup_bars(self) -> int:
@@ -490,9 +502,22 @@ class GrowthValue(Strategy):
         from ..data import fundamental as fd
         code = str(df["code"].iloc[0])
         dates = df["date"].dt.strftime("%Y-%m-%d").tolist()
-        for field, col in (("revenue_yoy", "f_rev_yoy"), ("bps", "f_bps")):
+        p = self.params
+        fields = [("revenue_yoy", "f_rev_yoy"), ("bps", "f_bps")]
+        # 开关关着就不取，默认行为和耗时都与加开关前完全一致
+        if int(p["require_profit"]):
+            fields.append(("profit", "f_profit"))
+        if float(p["min_rev_base"]) > 0:
+            fields += [("revenue", "f_rev"), ("ytd_months", "f_months")]
+        for field, col in fields:
             panel = fd.as_panel(field, dates, [code])
             df[col] = panel[code].to_numpy() if code in panel.columns else np.nan
+        if float(p["min_rev_base"]) > 0:
+            # 营收是年初至今累计值：先按该期覆盖月数年化（一季报 ×4、中报 ×2），
+            # 再按同比倒推上年同期。同比 <= -100% 时基数无意义，置空后自然被 entry 剔除。
+            annual = df["f_rev"].astype("float64") * 12.0 / df["f_months"]
+            yoy = df["f_rev_yoy"].astype("float64").where(df["f_rev_yoy"] > -100)
+            df["f_rev_base"] = annual / (1.0 + yoy / 100.0)
         # BP = 每股净资产 / 价格。用 BP 而不是 PB：PB 在净资产为负时会变成
         # "很小的负数"，排序上反而排到前面，是估值因子最常见的陷阱。
         df["f_bp"] = df["f_bps"] / df["close"].replace(0, np.nan)
@@ -503,7 +528,18 @@ class GrowthValue(Strategy):
         ok = df["f_rev_yoy"].notna() & df["f_bp"].notna() & (df["f_bps"] > 0)
         if float(p["max_pb"]) > 0:
             ok &= df["f_bp"] >= 1.0 / float(p["max_pb"])
+        # NaN 比较恒为 False：缺数据的一律不买，不会因为取不到利润就放进来
+        if int(p["require_profit"]):
+            ok &= df["f_profit"] > 0
+        if float(p["min_rev_base"]) > 0:
+            ok &= df["f_rev_base"] >= float(p["min_rev_base"]) * 1e8
         return safe(ok)
+
+    def validate(self) -> None:
+        if int(self.params["require_profit"]) not in (0, 1):
+            raise ValueError("require_profit 只能是 0 或 1")
+        if float(self.params["min_rev_base"]) < 0:
+            raise ValueError("min_rev_base 不能为负")
 
     def exit(self, df: pd.DataFrame) -> pd.Series:
         # 不设结构性离场：靠「最长持有(日)」定期调仓重排。
