@@ -463,8 +463,14 @@ class GrowthValue(Strategy):
         "q_growth（成长用单季营收同比）2026-09 测过、**不采用**：质量版上 2019-2021 +82.5%→+92.4%，"
         "2022-2026.9 +62.9%→+54.9% 且回撤 -30.7%→-41.5%，逐年只有 3/8 好于累计口径。"
         "单季更新鲜也更吵，噪声吃掉了时效。开关留着，免得再试一遍。\n"
-        "已知偏差（未修）：BP 跨行业不可比，打分天然偏向金融地产。800 只池里它们只占 6-11%，"
-        "买入却占 31-50%，而且两段区间里这部分交易的每笔收益都低于其他行业。"
+        "行业集中（已知，不修）：BP 跨行业不可比，打分天然偏向金融地产。800 只池里它们只占 6-11%，"
+        "买入却占 31-50%，这部分交易每笔收益也低于其他行业——看起来像拖累，其实不是。"
+        "ind_bp（价值按行业内排名）2026-09 测过、**不采用**：集中度确实降下来了（后一段 33%→8%），"
+        "但质量版 2019-2021 +82.5%→+25.9%、2022-2026.9 +62.9%→+37.7% 且回撤 -30.7%→-42.2%，"
+        "逐年差 6/8。换上来的「本行业里便宜」的非金融股每笔从 +1.6% 掉到 +0.8%："
+        "原版里非金融股赚钱，靠的正是绝对便宜，行业中性把价值因子起作用的那部分一起去掉了。"
+        "集中是风险，不是收益拖累。\n"
+        "到这里 2019-2026 已经被这四个方向反复看过，不再适合继续在上面找改进——交给前向模拟盘。"
     )
     # 两个分量交给引擎做横截面百分位归一后等权相加。
     # 不能在 score() 里自己 rank——那排的是时间维度，还会用到未来数据。
@@ -483,6 +489,7 @@ class GrowthValue(Strategy):
         "require_profit": 0,      # 1=剔除最新一期净利润 <=0 的：营收增长没变成利润
         "min_rev_base": 0.0,      # 上年同期营收（年化，亿元）下限，0=不限。防低基数
         "q_growth": 0,            # 1=成长分量用单季营收同比，0=累计同比（原口径）
+        "ind_bp": 0,              # 1=价值分量用行业内 BP 百分位，0=全市场 BP（原口径）
     }
     param_meta = {
         "index_ma": {"label": "大盘择时均线", "min": 0, "max": 400, "step": 10,
@@ -499,6 +506,9 @@ class GrowthValue(Strategy):
         "q_growth": {"label": "成长用单季同比", "min": 0, "max": 1, "step": 1,
                      "hint": "1=用最新单季的营收同比。累计同比里混着前几个季度，"
                              "最新一季的变化会被稀释"},
+        "ind_bp": {"label": "价值按行业内排名", "min": 0, "max": 1, "step": 1,
+                   "hint": "1=BP 在同行业里排名。银行市净率常年零点几，"
+                           "全市场排名会让金融地产天然高分"},
     }
 
     def warmup_bars(self) -> int:
@@ -534,11 +544,15 @@ class GrowthValue(Strategy):
         # BP = 每股净资产 / 价格。用 BP 而不是 PB：PB 在净资产为负时会变成
         # "很小的负数"，排序上反而排到前面，是估值因子最常见的陷阱。
         df["f_bp"] = df["f_bps"] / df["close"].replace(0, np.nan)
+        if int(p["ind_bp"]):
+            # 全市场同行业里的 BP 百分位，面板进程内只建一次，见 fundamental.bp_industry_pct
+            df["f_bp_ind"] = fd.bp_industry_pct(dates, code)
         return df
 
     def entry(self, df: pd.DataFrame) -> pd.Series:
         p = self.params
-        ok = df[self._growth_col].notna() & df["f_bp"].notna() & (df["f_bps"] > 0)
+        ok = (df[self._growth_col].notna() & df[self._value_col].notna()
+              & df["f_bp"].notna() & (df["f_bps"] > 0))
         if float(p["max_pb"]) > 0:
             ok &= df["f_bp"] >= 1.0 / float(p["max_pb"])
         # NaN 比较恒为 False：缺数据的一律不买，不会因为取不到利润就放进来
@@ -555,6 +569,8 @@ class GrowthValue(Strategy):
             raise ValueError("min_rev_base 不能为负")
         if int(self.params["q_growth"]) not in (0, 1):
             raise ValueError("q_growth 只能是 0 或 1")
+        if int(self.params["ind_bp"]) not in (0, 1):
+            raise ValueError("ind_bp 只能是 0 或 1")
 
     def exit(self, df: pd.DataFrame) -> pd.Series:
         # 不设结构性离场：靠「最长持有(日)」定期调仓重排。
@@ -571,8 +587,9 @@ class GrowthValue(Strategy):
         # 成长分量用哪一列。低基数判断（min_rev_base）始终用累计同比倒推上年同期，
         # 那是「年化营收规模」的定义，与打分用哪种同比无关。
         self._growth_col = "f_rev_q_yoy" if int(self.params["q_growth"]) else "f_rev_yoy"
+        self._value_col = "f_bp_ind" if int(self.params["ind_bp"]) else "f_bp"
         self.score_fields = [(self._growth_col, float(self.params["w_growth"])),
-                             ("f_bp", float(self.params["w_value"]))]
+                             (self._value_col, float(self.params["w_value"]))]
 
     def reason(self, row: pd.Series, action: str) -> str:
         if action == "BUY":
@@ -581,7 +598,10 @@ class GrowthValue(Strategy):
             growth = (f"单季营收同比 {row['f_rev_q_yoy']:+.1f}%（累计 {row['f_rev_yoy']:+.1f}%）"
                       if self._growth_col == "f_rev_q_yoy"
                       else f"营收同比 {row['f_rev_yoy']:+.1f}%")
-            return f"{growth}，市净率 {pb:.2f}（BP {row['f_bp']:.3f}）"
+            value = (f"市净率 {pb:.2f}（行业内 BP 分位 {row['f_bp_ind']:.0%}）"
+                     if self._value_col == "f_bp_ind"
+                     else f"市净率 {pb:.2f}（BP {row['f_bp']:.3f}）")
+            return f"{growth}，{value}"
         return "调仓期到，重排候选"
 
 

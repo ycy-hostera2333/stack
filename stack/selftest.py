@@ -1108,6 +1108,27 @@ def _t_fund_period():
     return "边界日期全部正确；" + (f"当前库：{stale}" if stale else "当前库的基本面是最新一期")
 
 
+@check("基本面：行业内 BP 分位——各行业各自排名，小行业退回全市场")
+def _t_industry_pct():
+    """BP 跨行业不可比，全市场统一排名会让金融地产天然高分（实测银行平均分位 0.98）。
+    行业内排名后每个行业的最高 BP 都应该是 1.0，与行业整体估值高低无关。"""
+    from .data import fundamental as fd
+    vals = pd.DataFrame(
+        [[2.0, 2.5, 3.0, 3.5, 4.0, 0.10, 0.20, 0.30, 0.40, 0.50, 9.0, np.nan]],
+        index=["D"],
+        columns=["b1", "b2", "b3", "b4", "b5", "t1", "t2", "t3", "t4", "t5", "x1", "x2"])
+    ind = pd.Series({"b1": "银行", "b2": "银行", "b3": "银行", "b4": "银行", "b5": "银行",
+                     "t1": "软件", "t2": "软件", "t3": "软件", "t4": "软件", "t5": "软件",
+                     "x1": "小行业", "x2": "小行业"})
+    got = fd.industry_pct(vals, ind, min_group=5).loc["D"]
+    assert got["b5"] == 1.0 and got["t5"] == 1.0, (
+        f"行业内最高 BP 都应排第一：银行 {got['b5']}，软件 {got['t5']}")
+    assert got["t1"] == got["b1"], "两个行业里名次相同的股票，分位应该相同"
+    assert got["x1"] == vals.loc["D"].rank(pct=True)["x1"], "不足 5 只的行业没有退回全市场排名"
+    assert np.isnan(got["x2"]), "缺失值不该被排出名次"
+    return "银行与软件各自排名；小行业退回全市场；缺失不排名"
+
+
 # ------------------------------------------------------------------ 入口
 def run_all(verbose: bool = True) -> bool:
     _RESULTS.clear()

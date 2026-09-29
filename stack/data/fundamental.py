@@ -233,6 +233,83 @@ def clear_cache() -> None:
     global _PIT_LONG
     _PIT_LONG = None
     _PIT_WIDE.clear()
+    _BP_IND.clear()
+
+
+# ------------------------------------------------------------------ 行业内 BP 分位
+# BP 跨行业不可比：银行市净率常年零点几，科技股动辄 5 倍以上。全市场统一排百分位，
+# 金融地产在「价值」这一半天然高分——2026-09 实测 growth_value 在 800 只池里，
+# 金融地产只占 6-11%，买入却占 31-50%，且这部分交易每笔收益两段区间都低于其他行业。
+#
+# 这里在**全市场同行业**里给每只股票的 BP 排百分位，作为一个普通字段交给引擎。
+# 不改引擎/模拟盘/每日信号那三处横截面排名：某天某只股票的这个值只取决于当天
+# 同行业的全部股票，任何路径取到的都一样，三处天然一致。
+MIN_INDUSTRY = 5              # 行业内当日有效股票少于此数，改用全市场百分位
+_BP_IND: dict = {}
+
+
+def industry_pct(values: pd.DataFrame, industry: pd.Series,
+                 min_group: int = MIN_INDUSTRY) -> pd.DataFrame:
+    """逐日在行业内排百分位。纯函数，自检直接喂构造数据。
+
+    values：日期 × 股票；industry：股票 -> 行业（缺失归入「未分类」）。
+    某行业当日有效值不足 min_group 只时，这些格子改用全市场百分位——
+    三五只股票的组内排名基本是噪声，排第一不说明任何事。
+    """
+    ind = industry.reindex(values.columns).fillna("未分类")
+    market = values.rank(axis=1, pct=True)
+    out = pd.DataFrame(np.nan, index=values.index, columns=values.columns)
+    for _name, cols in ind.groupby(ind).groups.items():
+        sub = values[cols]
+        r = sub.rank(axis=1, pct=True)
+        small = sub.notna().sum(axis=1) < min_group
+        if small.any():
+            r.loc[small] = market.loc[small, cols]
+        out[cols] = r
+    return out
+
+
+def _latest_industry() -> pd.Series:
+    """每只股票最新一期报告里的行业。用最新标签而不是逐期标签：行业变更极少，
+    这点前视可以忽略；逐期标签反而会让同一只股票在换期时跳组。"""
+    fd = _pit_long()
+    if fd.empty or "industry" not in fd.columns:
+        return pd.Series(dtype=object)
+    f = fd.dropna(subset=["industry"]).sort_values("period")
+    return f.groupby("code")["industry"].last()
+
+
+def _build_bp_industry(lo: str, hi: str) -> pd.DataFrame:
+    with store.connect() as c:
+        px = pd.read_sql("SELECT code, date, close FROM daily WHERE date BETWEEN ? AND ? "
+                         "AND code NOT LIKE 'IDX%'", c, params=(lo, hi))
+    if px.empty:
+        return pd.DataFrame()
+    close = px.pivot(index="date", columns="code", values="close")
+    close = close.where(close > 0)          # 前复权负价没有意义，不参与排名
+    bps = as_panel("bps", close.index.tolist(), list(close.columns)).astype("float64")
+    bp = (bps / close).where(bps > 0)       # 净资产为负的不参与：同 entry 的口径
+    return industry_pct(bp, _latest_industry()).astype("float32")
+
+
+def bp_industry_pct(dates: list[str], code: str) -> np.ndarray:
+    """该股每个交易日的「行业内 BP 百分位」（全市场同行业里的名次，0~1）。
+
+    整张面板按请求的日期跨度建一次、进程内缓存；后来的请求落在已建跨度内就直接取列。
+    引擎逐股调用时各股的日期跨度基本相同，所以全市场只建一次。
+    """
+    if not dates:
+        return np.array([], dtype="float32")
+    lo, hi = dates[0], dates[-1]
+    p = _BP_IND.get("panel")
+    if p is None or lo < _BP_IND["lo"] or hi > _BP_IND["hi"]:
+        lo = min(lo, _BP_IND.get("lo", lo))
+        hi = max(hi, _BP_IND.get("hi", hi))
+        p = _build_bp_industry(lo, hi)
+        _BP_IND.update(panel=p, lo=lo, hi=hi)
+    if p.empty or code not in p.columns:
+        return np.full(len(dates), np.nan, dtype="float32")
+    return p[code].reindex(dates).to_numpy(dtype="float32")
 
 
 def single_quarter_yoy(fd: pd.DataFrame) -> pd.Series:
