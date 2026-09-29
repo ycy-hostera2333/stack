@@ -310,13 +310,19 @@ def _fetch_tencent(code: str, start: str, end: str,
         cur = seg_start - pd.Timedelta(days=1)
 
     raw_parts = [_fetch_tencent_span(code, a, b, adjust) for a, b in spans]
-    # 每段都「正常应答但没数据」→ 这只股票就是没数据，不是源挂了
-    all_ok = bool(raw_parts) and all(_source_ok(p) or (p is not None and not p.empty)
-                                     for p in raw_parts)
-    parts = raw_parts
-    parts = [p for p in parts if p is not None and not p.empty]
+    # 任何一段真失败（不是「正常应答但没数据」）就整只算失败。
+    # 曾经是跳过失败段、把其余几段拼起来返回：全量重建时中间一段被限流，
+    # 拼出来的历史少一截照样写库，缺口里留着旧复权口径的老数据，不报错。
+    failed = [p for p in raw_parts
+              if (p is None or p.empty) and not _source_ok(p)]
+    if failed or not raw_parts:
+        out = pd.DataFrame()
+        out.attrs["error"] = next((p.attrs.get("error") for p in failed
+                                   if p is not None and p.attrs.get("error")), "空应答")
+        return out
+    parts = [p for p in raw_parts if p is not None and not p.empty]
     if not parts:
-        return _empty_ok() if all_ok else pd.DataFrame()
+        return _empty_ok()               # 每段都正常应答但没数据：这只股票就是没数据
     out = (pd.concat(parts, ignore_index=True)
              .drop_duplicates(subset=["date"])
              .sort_values("date").reset_index(drop=True))
@@ -404,11 +410,43 @@ def _fetch_tencent_span(code: str, start: str, end: str,
             df["amount"] = df["volume"] * 100.0 * df["close"]
             df["turnover"] = pd.NA
             return df.dropna(subset=["close"])
-        except Exception:
+        except Exception as e:
             if attempt == RETRY - 1:
-                return pd.DataFrame()
+                # 把真实原因带出去。被封时腾讯回的是 HTTP 501，以前这里一律吞掉，
+                # 界面只剩「四个源全部失败」，看不出是封禁、断网还是代理没开。
+                out = pd.DataFrame()
+                out.attrs["error"] = _describe_error(e)
+                return out
             time.sleep(RETRY_SLEEP * (2 ** attempt) * (0.5 + random.random()))
     return pd.DataFrame()
+
+
+def _describe_error(e: Exception) -> str:
+    """异常 → 一行短说明，写进 sync_errors.reason。HTTPError 带上状态码。"""
+    code = getattr(e, "code", None)
+    msg = str(e).splitlines()[0][:80] if str(e) else ""
+    return f"{type(e).__name__}{f' {code}' if code else ''}: {msg}".strip()
+
+
+def _normalize_baostock(df: pd.DataFrame) -> pd.DataFrame:
+    """把 BaoStock 的日线换算到腾讯口径。纯函数，自检直接喂构造数据。
+
+    2026-09 实测（60 只 × 7 天）：开高低收与腾讯比值 1.0000（±0.1%），
+    但 volume 恰好 100 倍——BaoStock 是股，腾讯是手。不换算的话同一只股票
+    前后两段成交量差两个数量级，量比类指标全错，而且不报错。
+    amount 按腾讯的估算式重算（volume×100×close），让同一列里口径一致；
+    BaoStock 自带的真实成交额与这个估算差 ±3%，混用反而会在拼接点跳一下。
+    tradestatus=0（停牌）的行去掉：腾讯不返回停牌日，保留会多出零成交的假交易日。
+    """
+    df = df.copy()
+    if "tradestatus" in df.columns:
+        df = df[df["tradestatus"].astype(str) == "1"].drop(columns="tradestatus")
+    df["volume"] = df["volume"] / 100.0
+    df["amount"] = df["volume"] * 100.0 * df["close"]
+    df = df.sort_values("date").reset_index(drop=True)
+    df["pct_chg"] = df["close"].pct_change() * 100
+    df["turnover"] = pd.NA
+    return df
 
 
 def _fetch_baostock_unlocked(code: str, start: str, end: str,
@@ -441,7 +479,7 @@ def _fetch_baostock_unlocked(code: str, start: str, end: str,
             try:
                 rs = bs.query_history_k_data_plus(
                     bs_code,
-                    "date,open,high,low,close,volume,amount",
+                    "date,open,high,low,close,volume,amount,tradestatus",
                     start_date=start_iso, end_date=end_iso,
                     frequency="d", adjustflag=adj_flag,
                 )
@@ -454,14 +492,13 @@ def _fetch_baostock_unlocked(code: str, start: str, end: str,
                 if not rows:
                     return pd.DataFrame()
                 df = pd.DataFrame(rows, columns=[
-                    "date", "open", "high", "low", "close", "volume", "amount"])
+                    "date", "open", "high", "low", "close", "volume", "amount",
+                    "tradestatus"])
                 df["code"] = code
                 df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
                 for c in ("open", "high", "low", "close", "volume", "amount"):
                     df[c] = pd.to_numeric(df[c], errors="coerce")
-                df["pct_chg"] = pd.NA
-                df["turnover"] = pd.NA
-                return df.dropna(subset=["close"])
+                return _normalize_baostock(df.dropna(subset=["close"]))
             finally:
                 bs.logout()
         except Exception:
@@ -551,10 +588,14 @@ def fetch_daily(code: str, start: str = HISTORY_START, end: str | None = None,
     end = end or datetime.now().strftime("%Y%m%d")
     start_compact = pd.to_datetime(start).strftime("%Y%m%d")
     end_compact = pd.to_datetime(end).strftime("%Y%m%d")
+    # 每个源的结局，全部失败时拼成一条原因写进 sync_errors
+    why = {"tencent": "熔断跳过", "baostock": "未启用" if not USE_BAOSTOCK else "熔断跳过",
+           "tushare": "熔断跳过", "akshare": "熔断跳过"}
 
     # 1) 腾讯（最快，绕开东财 CDN）
     if not _circuit_open("tencent"):
         df = _fetch_tencent(code, start, end, adjust)
+        why["tencent"] = _why(df)
         if not df.empty:
             _circuit_reset("tencent")
             if on_event:
@@ -571,6 +612,7 @@ def fetch_daily(code: str, start: str = HISTORY_START, end: str | None = None,
     # 2) BaoStock —— **默认不启用**，见 USE_BAOSTOCK 的说明
     if USE_BAOSTOCK and not _circuit_open("baostock"):
         df = _fetch_baostock(code, start, end, adjust)
+        why["baostock"] = _why(df)
         if not df.empty:
             _circuit_reset("baostock")
             if on_event:
@@ -587,6 +629,7 @@ def fetch_daily(code: str, start: str = HISTORY_START, end: str | None = None,
     # 3) Tushare Pro（需要 token，退市股专用也能兜底）
     if not _circuit_open("tushare"):
         df = _fetch_tushare(code, start, end, adjust)
+        why["tushare"] = _why(df)
         if not df.empty:
             _circuit_reset("tushare")
             if on_event:
@@ -603,6 +646,7 @@ def fetch_daily(code: str, start: str = HISTORY_START, end: str | None = None,
     # 4) akshare（东财，最全字段但慢）
     if not _circuit_open("akshare"):
         df = _fetch_akshare(code, start_compact, end_compact, adjust)
+        why["akshare"] = _why(df)
         if not df.empty:
             _circuit_reset("akshare")
             if on_event:
@@ -619,8 +663,147 @@ def fetch_daily(code: str, start: str = HISTORY_START, end: str | None = None,
     # 全部失败：记录原因
     if on_event:
         on_event("none", 0)
-    store.log_sync_error(code, "tencent/baostock/tushare/akshare 全部失败", attempt=RETRY)
+    store.log_sync_error(code, "全部失败｜" + "｜".join(f"{k}: {v}" for k, v in why.items()),
+                         attempt=RETRY)
     return pd.DataFrame()
+
+
+def _index_last_date(symbol: str = "IDX000300") -> str | None:
+    with store.connect() as c:
+        row = c.execute("SELECT max(date) FROM daily WHERE code=?", (symbol,)).fetchone()
+    return row[0] if row else None
+
+
+# ------------------------------------------------------------------ 除权检测
+# 增量同步只往回重拉 overlap_days。分红送转之后前复权会把**整段**历史一起改掉，
+# 库里 7 天以前的部分还是旧口径，于是在重叠窗口的起点留下一个假跳空——
+# 所有均线、动量都会把它当成真实涨跌，不报错。
+#
+# 容差：库存价和新拉的价都来自腾讯、小数位相同，口径没变时逐位相等；
+# 只有用 BaoStock 补过的日子会有 ±0.1% 的差异（2026-09 实测 60 只 × 7 天）。
+ADJ_TOLERANCE = 0.002
+# 重建/审计量小（几十到几百只），被封后不必像大批量同步那样撞满 ABORT_STREAK 次
+_STOP_STREAK = 20
+
+
+def basis_ratio(db: pd.DataFrame, net: pd.DataFrame) -> float | None:
+    """两份 [date, close] 在重叠日上的收盘价比值中位数（net / db）。无重叠返回 None。纯函数。"""
+    if db is None or net is None or db.empty or net.empty:
+        return None
+    m = db[["date", "close"]].merge(net[["date", "close"]], on="date",
+                                    suffixes=("_db", "_net"))
+    m = m[(m["close_db"] > 0) & (m["close_net"] > 0)]
+    if m.empty:
+        return None
+    return float((m["close_net"] / m["close_db"]).median())
+
+
+def _basis_moved(ratio: float | None) -> bool:
+    return ratio is not None and abs(ratio - 1.0) > ADJ_TOLERANCE
+
+
+def _basis_ratio(code: str, net: pd.DataFrame, last_date: str | None) -> float | None:
+    """新拉的增量与库存数据在重叠日上的比值。排除库里最后一天——它可能是盘中
+    写进去的半截 K 线，收盘价本来就会变，不能当成除权的证据。"""
+    if not last_date or net is None or net.empty:
+        return None
+    with store.connect() as c:
+        db = pd.read_sql("SELECT date, close FROM daily WHERE code=? AND date>=? AND date<?",
+                         c, params=(code, str(net["date"].min()), last_date))
+    return basis_ratio(db, net)
+
+
+def _rebuild_history(codes: list[str], cancel_check=None, progress=None) -> dict:
+    """整只重拉全部历史并替换（先删后写，同一事务）。"""
+    out = {"ok": 0, "rows": 0, "failed_codes": []}
+    streak = 0
+    for i, code in enumerate(codes):
+        if cancel_check and cancel_check():
+            out["failed_codes"] += codes[i:]
+            break
+        df = fetch_daily(code, start=HISTORY_START)
+        if df.empty:
+            out["failed_codes"].append(code)
+            streak += 1
+            if streak >= _STOP_STREAK:          # 连续失败多半是被封了，别再往上撞
+                out["failed_codes"] += codes[i + 1:]
+                break
+            continue
+        streak = 0
+        out["rows"] += store.replace_daily(code, df)
+        out["ok"] += 1
+        store.clear_sync_errors([code])
+        if progress:
+            progress(i + 1, len(codes), out)
+    return out
+
+
+def audit_adjustments(n: int = 300, progress=None, cancel_check=None) -> dict:
+    """轮转审计：每次查 n 只，拉最早一段历史跟库里比，对不上就整只重建。
+
+    日常同步的检测只看得到重叠窗口，检测上线**之前**留下的断层，重叠窗口早就是
+    新口径了，只能靠这个找出来。最早那段是最灵敏的位置：上次拉全量之后只要除过
+    一次权，它就一定对不上。2026-09 抽 60 只有 2 只断层（最大偏 7.7%）。
+
+    每只 1 次请求，有断层的再加 4-5 次。游标存在 meta，下次从断点接着查，
+    所以可以分几次跑完全库，不会一次把腾讯的额度打光。
+    """
+    inst = store.load_instruments()
+    if "status" in inst.columns:
+        inst = inst[inst["status"].fillna("listed") != "delisted"]
+    last = store.last_dates()
+    codes = sorted(c for c in inst["code"] if c in last)
+    stats = {"total": len(codes), "checked": 0, "moved": 0, "failed": 0,
+             "rebuilt": 0, "rows": 0, "moved_codes": [], "cursor": ""}
+    if not codes:
+        return stats
+    cursor = store.get_meta("adj_audit_cursor") or ""
+    k = next((i for i, c in enumerate(codes) if c > cursor), 0)
+    batch = (codes[k:] + codes[:k])[:max(0, int(n))]
+
+    streak = 0
+    for i, code in enumerate(batch, 1):
+        if cancel_check and cancel_check():
+            break
+        with store.connect() as c:
+            first = c.execute("SELECT min(date) FROM daily WHERE code=?", (code,)).fetchone()[0]
+        end = (pd.Timestamp(first) + pd.Timedelta(days=60)).strftime("%Y-%m-%d")
+        net = _fetch_tencent_span(code, first, end)
+        if net is None or net.empty:
+            if not _source_ok(net):
+                stats["failed"] += 1
+                streak += 1
+                if streak >= _STOP_STREAK:      # 被封了：停下，游标留在最后查过的那只
+                    break
+                continue
+        else:
+            streak = 0
+            with store.connect() as c:
+                db = pd.read_sql("SELECT date, close FROM daily WHERE code=? AND date<=?",
+                                 c, params=(code, end))
+            if _basis_moved(basis_ratio(db, net)):
+                stats["moved_codes"].append(code)
+        stats["checked"] += 1
+        stats["cursor"] = code
+        store.set_meta("adj_audit_cursor", code)
+        if progress and i % 50 == 0:
+            progress(i, len(batch), stats)
+
+    stats["moved"] = len(stats["moved_codes"])
+    if stats["moved_codes"]:
+        rb = _rebuild_history(stats["moved_codes"], cancel_check=cancel_check)
+        stats["rebuilt"], stats["rows"] = rb["ok"], rb["rows"]
+        stats["rebuild_failed"] = rb["failed_codes"]
+    return stats
+
+
+def _why(df: pd.DataFrame) -> str:
+    """一个源拿回空表时，说清楚是哪种空。"""
+    if not df.empty:
+        return "成功"
+    if _source_ok(df):
+        return "正常应答但无数据"
+    return df.attrs.get("error") or "空应答"
 
 
 def market_closed_today() -> bool:
@@ -692,7 +875,17 @@ def _sync_daily_impl(codes: list[str] | None = None, full: bool = False,
     # sync_errors 仍然保留，用于界面展示哪些股票失败过、失败原因是什么。
     last = {} if full else store.last_dates()
     today = datetime.now().strftime("%Y-%m-%d")
-    _complete = store.last_complete_day() if behind_only else None
+    # --behind 的目标日：库里已知的最新交易日。以沪深300 的最后一根为准
+    # （指数先于个股同步、四根请求几乎不会失败），退而求其次用最后一个完整交易日。
+    #
+    # 曾经只用 last_complete_day，有个自己挖的坑：上一轮 --behind 把残日补齐后，
+    # 锚点前移到那一天，剩下那批最后日期**正好等于**锚点的股票被整批跳过，
+    # 永远拉不到更新的日子。实测 2026-09-22：09-18 补齐后，09-21/22 卡在
+    # 1870/4564 只，再跑多少次 --behind 都是 0 只待更新。
+    _complete = None
+    if behind_only:
+        _complete = max((d for d in (store.last_complete_day(), _index_last_date())
+                         if d), default=None)
 
     # 只有当"本地已有今天的数据"且"上次同步发生在今天收盘之后"时，才认为数据已是最终版，
     # 可以整只跳过。盘中同步写下的当日 K 线不满足后一条，下次会被重新抓取覆盖。
@@ -704,16 +897,14 @@ def _sync_daily_impl(codes: list[str] | None = None, full: bool = False,
         if full or code not in last:
             pending.append((code, HISTORY_START))
         elif behind_only and _complete and last.get(code, "") >= _complete:
-            # --behind：这只已经有最新完整交易日的数据了，跳过。
+            # --behind：这只已经有最新交易日的数据了，跳过。
             #
             # 默认的增量同步为了覆盖盘中写下的残缺 K 线，会把**每一只**都往回
             # 重拉 7 天。数据断过几天再来补的时候，这意味着绝大多数请求是白发的：
             # 实测断 3 天后，4599 只里 3397 只已经是最新的，74% 的请求纯属浪费，
             # 还把限流额度提前打光，真正缺的那 1202 只反而补不上。
             #
-            # 只能当补缺工具用，不能设成默认：日常收盘后更新时，
-            # last_complete_day 还停在昨天，所有股票都「已到该日」，
-            # 全跳过就永远拉不到今天的数据。
+            # 不跳过的那些照样往回重拉 overlap_days，所以不会漏掉盘中残缺的 K 线。
             continue
         elif only_missing:
             # 本地已有数据 → 跳过。这正是 --only-missing 的意义：
@@ -741,6 +932,7 @@ def _sync_daily_impl(codes: list[str] | None = None, full: bool = False,
 
     total = len(pending)
     done = 0
+    rebuild: set[str] = set()            # 检测到除权、要整只重建的
 
     def _sweep(batch: list[tuple[str, str]], workers: int) -> list[tuple[str, str]]:
         """跑一遍，返回失败的（供下一轮重试）。
@@ -754,7 +946,9 @@ def _sync_daily_impl(codes: list[str] | None = None, full: bool = False,
         run = {"streak": 0, "since": 0.0, "aborted": False}
         with ThreadPoolExecutor(max_workers=workers) as pool:
             def _wrap(code, start):
-                if run["aborted"]:
+                # 取消要在每只发请求前查：以前只在两轮之间查一次，一轮 4000 多只
+                # 期间叫停不了。实测看门狗 250s 前就判定被封，同步照样把 4570 只跑完。
+                if run["aborted"] or (cancel_check and cancel_check()):
                     return pd.DataFrame()
 
                 def _cb(src, rows):
@@ -779,6 +973,14 @@ def _sync_daily_impl(codes: list[str] | None = None, full: bool = False,
                           and time.time() - run["since"] >= ABORT_SECONDS):
                         run["aborted"] = True
                         stats["aborted_passes"] = stats.get("aborted_passes", 0) + 1
+                elif starts[code] != HISTORY_START and _basis_moved(
+                        _basis_ratio(code, df, last.get(code))):
+                    # 重叠那几天的价格对不上：这只除过权，前复权把整段历史都改了。
+                    # **不能写这段增量**——写了之后重叠窗口就是新口径，下次再比就对得上，
+                    # 断层被永久藏在 7 天以前。留给下面整只重建；重建失败的话这只
+                    # 停在旧日期，下次同步还会比出来，自动重试。
+                    rebuild.add(code)
+                    run["streak"] = 0
                 else:
                     stats["rows"] += store.upsert_daily(df)
                     stats["ok"] += 1
@@ -812,6 +1014,15 @@ def _sync_daily_impl(codes: list[str] | None = None, full: bool = False,
             total += len(remaining)          # 重试的这些会被再数一遍
         stats["passes"] = pass_no
         remaining = _sweep(remaining, workers)
+
+    # 除权的整只重建放在最后：每只要拉 4-5 段全量，先保证日常增量落库。
+    if rebuild:
+        rb = _rebuild_history(sorted(rebuild), cancel_check=cancel_check)
+        stats["adjusted"] = len(rebuild)
+        stats["rebuilt"] = rb["ok"]
+        stats["ok"] += rb["ok"]
+        stats["rows"] += rb["rows"]
+        remaining = list(remaining) + [(c, HISTORY_START) for c in rb["failed_codes"]]
 
     stats["failed"] = len(remaining)
     stats["failed_codes"] = [c for c, _ in remaining]

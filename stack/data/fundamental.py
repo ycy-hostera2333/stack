@@ -95,6 +95,57 @@ def periods(start_year: int = 2017, end: str | None = None) -> list[str]:
     return out
 
 
+# 一期全市场约 5000 多家。低于这个数多半是还没披露完、或抓取被截断了。
+MIN_PERIOD_ROWS = 3000
+
+
+def _period_rows() -> dict[str, int]:
+    init()
+    with store.connect() as c:
+        return dict(c.execute(
+            "SELECT period, COUNT(*) FROM fundamentals GROUP BY period").fetchall())
+
+
+def _newest(ps) -> str | None:
+    """point-in-time 意义上最新的一期：先比披露截止日，撞车（年报与次年一季报
+    同在 4-30）时取报告期更新的——与 _pit_wide 的取行规则一致。"""
+    ps = list(ps)
+    return max(ps, key=lambda p: (avail_date(p), p)) if ps else None
+
+
+def expected_period(today: str | None = None) -> str | None:
+    """按法定披露截止日，today 这天应该已经用上的最新一期报告。"""
+    return _newest(periods(end=today))
+
+
+def staleness(today: str | None = None) -> str | None:
+    """库里的基本面落后于应有的报告期时返回一句提示，不落后返回 None。
+
+    2026-09 踩过：中报 08-31 就该用上，库里一直停在一季报，growth_value 按
+    半年前的财报选了四周股票，不报错。换成中报后 10 只候选换掉 5 只。
+    """
+    want = expected_period(today)
+    if not want:
+        return None
+    have = [p for p, n in _period_rows().items() if n >= MIN_PERIOD_ROWS]
+    if want in have:
+        return None
+    return (f"基本面最新只到 {_newest(have) or '（无）'}，按法定披露截止日 "
+            f"{avail_date(want)} 起应已有 {want}。基本面打分用的是过期财报——"
+            f"先跑 sync --fundamentals。")
+
+
+def sync_recent(progress=None, sleep: float = 0.8) -> dict:
+    """只补缺的报告期（已过截止日、但库里不足 MIN_PERIOD_ROWS 行的）。
+
+    全量 sync() 要把 2017 年以来 30 多期挨个抓一遍，每期几十页、一两分钟，
+    日常用不着；平时只有季报截止日（4/30、8/31、10/31）之后会冒出一期新的。
+    """
+    rows = _period_rows()
+    todo = [p for p in periods() if rows.get(p, 0) < MIN_PERIOD_ROWS]
+    return _sync_periods(todo, progress, sleep)
+
+
 def fetch_period(period: str) -> pd.DataFrame:
     """抓取单个报告期的全市场业绩数据。一次请求覆盖全部股票。"""
     import akshare as ak
@@ -115,9 +166,13 @@ def fetch_period(period: str) -> pd.DataFrame:
 
 def sync(start_year: int = 2017, progress=None, sleep: float = 0.8) -> dict:
     """同步所有报告期。约 34 个季度，每期一次请求。"""
+    return _sync_periods(periods(start_year), progress, sleep)
+
+
+def _sync_periods(ps: list[str], progress=None, sleep: float = 0.8) -> dict:
     init()
-    ps = periods(start_year)
-    stats = {"periods": len(ps), "ok": 0, "failed": 0, "rows": 0}
+    stats = {"periods": len(ps), "ok": 0, "failed": 0, "rows": 0,
+             "done": [], "failed_periods": []}
     cols = ["code", "period", "avail_date", "eps", "bps", "roe", "gross_margin",
             "ocfps", "revenue", "revenue_yoy", "profit", "profit_yoy", "industry"]
     for i, p in enumerate(ps, 1):
@@ -127,6 +182,7 @@ def sync(start_year: int = 2017, progress=None, sleep: float = 0.8) -> dict:
             df = pd.DataFrame()
         if df.empty:
             stats["failed"] += 1
+            stats["failed_periods"].append(p)
         else:
             df = df.reindex(columns=cols)
             with store.connect() as c:
@@ -135,6 +191,7 @@ def sync(start_year: int = 2017, progress=None, sleep: float = 0.8) -> dict:
                     f"VALUES ({','.join('?' * len(cols))})", store._rows(df))
             stats["ok"] += 1
             stats["rows"] += len(df)
+            stats["done"].append(p)
             clear_cache()
         if progress:
             progress(i, len(ps), stats)
@@ -178,6 +235,36 @@ def clear_cache() -> None:
     _PIT_WIDE.clear()
 
 
+def single_quarter_yoy(fd: pd.DataFrame) -> pd.Series:
+    """单季营收同比（%），与 fd 同索引。纯函数，自检直接喂构造数据。
+
+    表里的 revenue 是年初至今累计值，revenue_yoy 也是累计同比：中报的同比里
+    混着一季度，三季报的混着前两个季度，最新那个季度的变化被稀释掉了。
+    单季 = 本期累计 - 上一期累计（一季度就是累计本身），再与上年同一季度比。
+
+    没有前视：用到的上一期、上年同期都不晚于本期，派生值随本期一起在本期的
+    法定截止日生效。缺上一期或上年同期（新股、缺报）时为 NaN；上年同季 <= 0 时
+    同比无意义，也记 NaN。
+    """
+    f = fd[["code", "period", "revenue"]].copy()
+    y = pd.to_numeric(f["period"].str[:4])
+    m = pd.to_numeric(f["period"].str[4:6])
+    cum = pd.Series(f["revenue"].to_numpy(dtype="float64"),
+                    index=pd.MultiIndex.from_arrays([f["code"], y, m]))
+    cum = cum[~cum.index.duplicated(keep="last")]
+
+    prev_cum = cum.reindex(pd.MultiIndex.from_arrays([f["code"], y, m - 3])).to_numpy()
+    sq = np.where(m.to_numpy() == 3, f["revenue"].to_numpy(dtype="float64"),
+                  f["revenue"].to_numpy(dtype="float64") - prev_cum)
+    sq_idx = pd.Series(sq, index=pd.MultiIndex.from_arrays([f["code"], y, m]))
+    sq_idx = sq_idx[~sq_idx.index.duplicated(keep="last")]
+    base = sq_idx.reindex(pd.MultiIndex.from_arrays([f["code"], y - 1, m])).to_numpy()
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        yoy = np.where(base > 0, (sq / base - 1.0) * 100.0, np.nan)
+    return pd.Series(yoy, index=fd.index)
+
+
 def _pit_long() -> pd.DataFrame:
     global _PIT_LONG
     if _PIT_LONG is None:
@@ -200,6 +287,8 @@ def _pit_wide(field: str) -> pd.DataFrame:
             # 必须跟着行走、不能按交易日推算：某公司当期缺报时 ffill 会拿到更早一期，
             # 按日期推出来的月数就对不上（例：缺一季报时拿到的是 12 个月的年报）。
             fd = fd.assign(ytd_months=pd.to_numeric(fd["period"].str[4:6]))
+        elif field == "revenue_q_yoy" and not fd.empty:
+            fd = fd.assign(revenue_q_yoy=single_quarter_yoy(fd))
         if fd.empty or field not in fd.columns:
             w = pd.DataFrame()
         else:

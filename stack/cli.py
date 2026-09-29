@@ -31,7 +31,8 @@ def cmd_sync(args) -> None:
     store.init_db()
     t0 = time.time()
 
-    if args.instruments or not (args.daily or args.index):
+    if args.instruments or not (args.daily or args.index
+                                or args.fundamentals or args.audit):
         print("同步股票列表…")
         n = source.sync_instruments()
         print(f"  股票列表 {n} 只")
@@ -91,6 +92,9 @@ def cmd_sync(args) -> None:
         print(f"\n  待更新 {stats['pending']} 只，成功 {stats['ok']}，"
               f"失败 {stats['failed']}，写入 {stats['rows']:,} 行"
               f"（共 {stats.get('passes', 1)} 轮）")
+        if stats.get("adjusted"):
+            print(f"  其中 {stats['adjusted']} 只除过权（重叠日价格对不上），"
+                  f"已整只重建历史 {stats.get('rebuilt', 0)} 只。")
         if stats.get("aborted_passes"):
             print(f"  有 {stats['aborted_passes']} 轮因连续大面积失败被提前中止"
                   f"（判定为上游限流，继续打下去只会拖长封禁）。")
@@ -100,6 +104,38 @@ def cmd_sync(args) -> None:
             print(f"  反复补不上就加 --slow：慢十倍但一次跑完，"
                   f"好过重跑十几轮。（--only-missing 只跳过「从没取到过」的，"
                   f"缺最近几天的这种它帮不上忙）")
+
+    if args.fundamentals:
+        from .data import fundamental
+        print("同步基本面（只补已过披露截止日、库里还缺的报告期）…")
+        st = fundamental.sync_recent(progress=lambda i, n, s: print(
+            f"\r  {i}/{n} 期  成功 {s['ok']}  失败 {s['failed']}", end="", flush=True))
+        if st["periods"] == 0:
+            print("  没有缺的报告期。")
+        else:
+            print(f"\n  补上 {', '.join(st['done']) or '无'}，写入 {st['rows']:,} 行"
+                  + (f"；失败 {', '.join(st['failed_periods'])}" if st["failed"] else ""))
+        stale = fundamental.staleness()
+        if stale:
+            print(f"  ⚠ {stale}")
+
+    if args.audit:
+        print(f"除权审计：本次查 {args.audit} 只（每只 1 次请求，拉最早一段历史跟库里比）…")
+        st = source.audit_adjustments(args.audit, progress=lambda i, n, s: print(
+            f"\r  {i}/{n}  已查 {s['checked']}  断层 {len(s['moved_codes'])}  "
+            f"失败 {s['failed']}", end="", flush=True))
+        print(f"\n  全库 {st['total']} 只，本次查了 {st['checked']} 只，"
+              f"发现断层 {st['moved']} 只，已重建 {st['rebuilt']} 只"
+              f"（写入 {st['rows']:,} 行）；游标停在 {st['cursor'] or '—'}")
+        if st["moved_codes"]:
+            print(f"  断层：{' '.join(st['moved_codes'][:30])}"
+                  + (" …" if st["moved"] > 30 else ""))
+        if st.get("rebuild_failed"):
+            print(f"  ⚠ 重建失败 {len(st['rebuild_failed'])} 只（多半被限流）："
+                  f"{' '.join(st['rebuild_failed'][:20])}。它们要等游标转一圈才会再查到，"
+                  "可以先 sync --daily 让日常检测兜住。")
+        if st["failed"]:
+            print(f"  有 {st['failed']} 只没拉到（多半被限流），游标没越过它们，下次接着查。")
 
     cov = store.coverage()
     print(f"\n本地库：{cov['codes_with_data']} 只有数据 / {cov['instruments']} 只已登记，"
@@ -122,6 +158,7 @@ def cmd_backtest(args) -> None:
         initial_cash=args.cash, max_positions=args.max_positions,
         stop_loss=args.stop_loss, take_profit=args.take_profit,
         trail_stop_atr=args.trail_stop_atr, max_hold_days=args.max_hold_days,
+        renew_ranked=args.renew_ranked,
     )
     print(f"策略 {strat.label}（{strat.name}）  股票池 {len(uni)} 只  "
           f"{args.start} ~ {args.end}")
@@ -246,11 +283,13 @@ def cmd_paper(args) -> None:
     if args.action == "init":
         params = json.loads(args.params) if args.params else {}
         paper.reset(args.strategy, params, args.cash, args.max_positions,
-                    args.top, args.max_hold_days, account=acct)
+                    args.top, args.max_hold_days, account=acct,
+                    renew_ranked=args.renew_ranked)
         print(f"模拟盘 {acct} 已建立：{args.strategy}  本金 {args.cash:,.0f}  "
               f"{args.max_positions} 仓位  股票池前 {args.top} 只  "
               + (f"每 {args.max_hold_days} 日调仓" if args.max_hold_days
-                 else "无持有期上限"))
+                 else "无持有期上限")
+              + ("（到期仍在前列则续持）" if args.renew_ranked else ""))
         if args.since:
             print(f"回补 {args.since} 至今…")
             # 必须按日期升序逐日推进：advance 会把 last_date 前移，
@@ -409,8 +448,13 @@ def main(argv=None) -> int:
                    help="慢速档（约 2.5 请求/秒）。被限流后补缺口用，"
                         "慢十倍但一次跑完")
     s.add_argument("--behind", action="store_true",
-                   help="只拉落后于最后一个完整交易日的股票。"
+                   help="只拉落后于最新交易日（沪深300 最后一根）的股票。"
                         "断了几天再来补时用，能省掉绝大多数请求")
+    s.add_argument("--fundamentals", action="store_true",
+                   help="补基本面：只拉已过披露截止日、库里还缺的报告期（季报截止日后跑）")
+    s.add_argument("--audit", type=int, metavar="N", default=0,
+                   help="除权审计：按顺序查 N 只，最早一段历史对不上就整只重建。"
+                        "游标会记住，分几次跑完全库，每只 1 次请求")
     s.set_defaults(func=cmd_sync)
 
     today = datetime.now().strftime("%Y-%m-%d")
@@ -424,11 +468,14 @@ def main(argv=None) -> int:
     b.add_argument("--end", default=last_ok)
     b.add_argument("--cash", type=float, default=200_000)
     b.add_argument("--max-positions", type=int, default=5)
-    b.add_argument("--stop-loss", type=float, default=0.0, help="如 0.08 表示 -8% 止损")
+    b.add_argument("--stop-loss", type=float, default=0.0, help="如 0.08 表示 -8%% 止损")
     b.add_argument("--take-profit", type=float, default=0.0)
     b.add_argument("--trail-stop-atr", type=float, default=0.0,
                    help="跟踪止损倍数，如 2.5 表示自持仓最高价回落 2.5×ATR 卖出")
     b.add_argument("--max-hold-days", type=int, default=0)
+    b.add_argument("--renew-ranked", action="store_true",
+                   help="到期时重新排名，仍在前 max-positions 名就续持，"
+                        "省掉卖了又原价买回的来回费用")
     b.add_argument("--min-amount", type=float, default=5e7, help="20日均成交额下限")
     b.add_argument("--top", type=int, help="只用流动性前 N 只做回测")
     b.add_argument("--params", help='策略参数 JSON，如 \'{"atr_stop":3}\'')
@@ -468,6 +515,8 @@ def main(argv=None) -> int:
                     help="持有期上限，到期卖出重排。0=不限。"
                          "exit() 恒为 False 的打分型策略（如 growth_value）必须设，"
                          "否则买满后永远不调仓")
+    pp.add_argument("--renew-ranked", action="store_true",
+                    help="init 时设定：到期仍在前 max-positions 名就续持")
     pp.add_argument("--since", help="init 时从该日期开始回补，如 2026-06-01")
     pp.add_argument("--account", default="default",
                     help="账户名。多个策略可并行前向验证，互不干扰")

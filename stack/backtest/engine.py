@@ -35,6 +35,16 @@ class BacktestConfig:
     take_profit: float = 0.0         # 硬止盈，0 为不启用
     trail_stop_atr: float = 0.0      # 跟踪止损：自持仓期间最高价回落 N×ATR 就卖，0 为不启用
     max_hold_days: int = 0           # 最长持有天数，0 为不限
+    # 到期时重新排名，仍在前 max_positions 名的续持（持有天数清零），不卖。
+    # 不开的话，到期一律卖出、同一天再按排名买入：growth_value 的基本面一季度才变
+    # 一次，排名很稳，实测到期卖出的 70-75% 当天就按同一开盘价原样买回，
+    # 白付一趟佣金+印花税，2019-2026 累计约占本金 8%（每年约 1%）。
+    #
+    # 但它**不只是省费用**：卖了再按「总资产 / 仓位数」买回，等于每个周期做一次
+    # 等权再平衡；续持之后赢家一直拿着、不再砍回均值。2026-09 实测（growth_value、
+    # 800 只、20 日）：笔数 180→49、285→68，收益 2019-2021 +2.5pp、2022-2026 -0.8pp，
+    # 省下的费用被再平衡效应抵掉，净效果在噪声内。实在的好处是操作次数少四分之三。
+    renew_ranked: bool = False
     min_hold_days: int = 1           # 最短持有天数，防止信号抖动导致次日就卖
     warmup_days: int = 400           # 指标预热窗口（自然日）
 
@@ -362,6 +372,19 @@ def run(strategy: Strategy, codes: list[str], start: str, end: str,
         op_t, cl_p = P.open[:, j], P.close[:, j - 1]
         valid_t, valid_p = P.valid[:, j], P.valid[:, j - 1]
 
+        # 用第 j-1 日的择时状态决定第 j 日能否开仓，与信号口径一致
+        regime_on = regime_arr is None or bool(regime_arr[j - 1])
+
+        # 到期续持的名单：与下面买入环节同一套筛选（昨日有入场信号、昨今两日都能
+        # 交易）和同一套排序，只是把已持有的也算进去。择时关闭时不续持——那种情况下
+        # 原逻辑卖出后也不会买回，续持反而改变了行为。模拟盘 advance() 逐字对应。
+        renew = None
+        if cfg.renew_ranked and cfg.max_hold_days > 0 and regime_on:
+            elig = np.flatnonzero(P.entry[:, j - 1] & valid_t & valid_p)
+            sc = P.score[elig, j - 1]
+            sc = np.where(np.isfinite(sc), sc, -np.inf)
+            renew = set(elig[np.argsort(-sc, kind="stable")][:cfg.max_positions].tolist())
+
         # ---------------------------------------------------- 1. 卖出
         for i in list(positions):
             pos = positions[i]
@@ -383,7 +406,10 @@ def run(strategy: Strategy, codes: list[str], start: str, end: str,
                 elif cfg.take_profit > 0 and prev_close >= pos.cost * (1 + cfg.take_profit):
                     reason = f"触发止盈 +{cfg.take_profit:.0%}（成本 {pos.cost:.2f}）"
                 elif cfg.max_hold_days > 0 and pos.hold_days >= cfg.max_hold_days:
-                    reason = f"持有满 {cfg.max_hold_days} 日到期"
+                    if renew is not None and i in renew:
+                        pos.hold_days = 0            # 仍在前 N 名：续持，重新计时
+                    else:
+                        reason = f"持有满 {cfg.max_hold_days} 日到期"
                 elif cfg.trail_stop_atr > 0:
                     # 跟踪止损必须在这里判：只有引擎知道持仓期内的最高价
                     atr = float(P.atr[i, j - 1])
@@ -418,8 +444,6 @@ def run(strategy: Strategy, codes: list[str], start: str, end: str,
             del positions[i]
 
         # ---------------------------------------------------- 2. 买入
-        # 用第 j-1 日的择时状态决定第 j 日能否开仓，与信号口径一致
-        regime_on = regime_arr is None or bool(regime_arr[j - 1])
         if not regime_on:
             regime_off_days += 1
         slots = (cfg.max_positions - len(positions)) if regime_on else 0

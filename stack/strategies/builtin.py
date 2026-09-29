@@ -459,7 +459,12 @@ class GrowthValue(Strategy):
         "起因是当时的候选里 3/10 上半年亏损、营收 +1409% 的那只上年同期只有 0.2 亿。"
         "两个阈值都是先验，不是回测挑出来的；是否有效只看前向模拟盘。\n"
         "  · 开两个开关（1 / 5 亿）后回测（800 只、20 日调仓）：2019-2021 +37.1%→+82.5%，2022-2026.9 +50.3%→+62.9%，回撤不变。"
-        "但改善几乎全来自 2021 一年（+30pp），2025 反而 -12.5pp，2019/2020/2023 无差别——这两段都已被看过多次，不作为有效性证据。"
+        "但改善几乎全来自 2021 一年（+30pp），2025 反而 -12.5pp，2019/2020/2023 无差别——这两段都已被看过多次，不作为有效性证据。\n"
+        "q_growth（成长用单季营收同比）2026-09 测过、**不采用**：质量版上 2019-2021 +82.5%→+92.4%，"
+        "2022-2026.9 +62.9%→+54.9% 且回撤 -30.7%→-41.5%，逐年只有 3/8 好于累计口径。"
+        "单季更新鲜也更吵，噪声吃掉了时效。开关留着，免得再试一遍。\n"
+        "已知偏差（未修）：BP 跨行业不可比，打分天然偏向金融地产。800 只池里它们只占 6-11%，"
+        "买入却占 31-50%，而且两段区间里这部分交易的每笔收益都低于其他行业。"
     )
     # 两个分量交给引擎做横截面百分位归一后等权相加。
     # 不能在 score() 里自己 rank——那排的是时间维度，还会用到未来数据。
@@ -467,6 +472,8 @@ class GrowthValue(Strategy):
     # 本策略完全不看技术指标：entry 只查两个基本面字段是否可用，exit 恒为 False。
     # 空元组让 add_common 一列都不算——全市场扫描省掉三千多次指标计算。
     indicators: tuple[str, ...] = ()
+    # 每日信号据此检查库里的财报是不是应有的最新一期，过期时给出警告
+    uses_fundamentals = True
     defaults = {
         "index_ma": 0,            # 大盘择时，0=关闭（实测只降回撤不提收益）
         "w_growth": 1.0,          # 权重：营收增长
@@ -475,6 +482,7 @@ class GrowthValue(Strategy):
         "max_pb": 0.0,            # 市净率上限，0=不限。防止买到净资产为负的壳
         "require_profit": 0,      # 1=剔除最新一期净利润 <=0 的：营收增长没变成利润
         "min_rev_base": 0.0,      # 上年同期营收（年化，亿元）下限，0=不限。防低基数
+        "q_growth": 0,            # 1=成长分量用单季营收同比，0=累计同比（原口径）
     }
     param_meta = {
         "index_ma": {"label": "大盘择时均线", "min": 0, "max": 400, "step": 10,
@@ -488,6 +496,9 @@ class GrowthValue(Strategy):
         "min_rev_base": {"label": "上年同期营收下限(亿,年化)", "min": 0, "max": 50,
                          "step": 1,
                          "hint": "0=不限。基数太小时营收同比是噪声，+1000% 往往只是从几千万涨到几亿"},
+        "q_growth": {"label": "成长用单季同比", "min": 0, "max": 1, "step": 1,
+                     "hint": "1=用最新单季的营收同比。累计同比里混着前几个季度，"
+                             "最新一季的变化会被稀释"},
     }
 
     def warmup_bars(self) -> int:
@@ -509,6 +520,8 @@ class GrowthValue(Strategy):
             fields.append(("profit", "f_profit"))
         if float(p["min_rev_base"]) > 0:
             fields += [("revenue", "f_rev"), ("ytd_months", "f_months")]
+        if int(p["q_growth"]):
+            fields.append(("revenue_q_yoy", "f_rev_q_yoy"))
         for field, col in fields:
             panel = fd.as_panel(field, dates, [code])
             df[col] = panel[code].to_numpy() if code in panel.columns else np.nan
@@ -525,7 +538,7 @@ class GrowthValue(Strategy):
 
     def entry(self, df: pd.DataFrame) -> pd.Series:
         p = self.params
-        ok = df["f_rev_yoy"].notna() & df["f_bp"].notna() & (df["f_bps"] > 0)
+        ok = df[self._growth_col].notna() & df["f_bp"].notna() & (df["f_bps"] > 0)
         if float(p["max_pb"]) > 0:
             ok &= df["f_bp"] >= 1.0 / float(p["max_pb"])
         # NaN 比较恒为 False：缺数据的一律不买，不会因为取不到利润就放进来
@@ -540,6 +553,8 @@ class GrowthValue(Strategy):
             raise ValueError("require_profit 只能是 0 或 1")
         if float(self.params["min_rev_base"]) < 0:
             raise ValueError("min_rev_base 不能为负")
+        if int(self.params["q_growth"]) not in (0, 1):
+            raise ValueError("q_growth 只能是 0 或 1")
 
     def exit(self, df: pd.DataFrame) -> pd.Series:
         # 不设结构性离场：靠「最长持有(日)」定期调仓重排。
@@ -553,14 +568,20 @@ class GrowthValue(Strategy):
 
     def __init__(self, **params):
         super().__init__(**params)
-        self.score_fields = [("f_rev_yoy", float(self.params["w_growth"])),
+        # 成长分量用哪一列。低基数判断（min_rev_base）始终用累计同比倒推上年同期，
+        # 那是「年化营收规模」的定义，与打分用哪种同比无关。
+        self._growth_col = "f_rev_q_yoy" if int(self.params["q_growth"]) else "f_rev_yoy"
+        self.score_fields = [(self._growth_col, float(self.params["w_growth"])),
                              ("f_bp", float(self.params["w_value"]))]
 
     def reason(self, row: pd.Series, action: str) -> str:
         if action == "BUY":
             pb = (1.0 / row["f_bp"]) if row.get("f_bp") else float("nan")
-            return (f"营收同比 {row['f_rev_yoy']:+.1f}%，"
-                    f"市净率 {pb:.2f}（BP {row['f_bp']:.3f}）")
+            # 显示打分实际用的那个同比，否则名单上的数字和排序依据对不上
+            growth = (f"单季营收同比 {row['f_rev_q_yoy']:+.1f}%（累计 {row['f_rev_yoy']:+.1f}%）"
+                      if self._growth_col == "f_rev_q_yoy"
+                      else f"营收同比 {row['f_rev_yoy']:+.1f}%")
+            return f"{growth}，市净率 {pb:.2f}（BP {row['f_bp']:.3f}）"
         return "调仓期到，重排候选"
 
 

@@ -176,8 +176,11 @@ def drop_account(account: str) -> dict:
 def reset(strategy: str = "regime_momentum", params: dict | None = None,
           cash: float = 200_000, max_positions: int = 5,
           top: int = 400, max_hold_days: int = 0,
-          account: str = DEFAULT_ACCOUNT) -> dict:
-    """新建/重置一个账户。只清空该账户，其他账户不受影响。"""
+          account: str = DEFAULT_ACCOUNT, renew_ranked: bool = False) -> dict:
+    """新建/重置一个账户。只清空该账户，其他账户不受影响。
+
+    renew_ranked：到期仍在前 max_positions 名就续持，见 BacktestConfig.renew_ranked。
+    """
     account = check_name(account)
     _init()
     get_strategy(strategy, **(params or {}))      # 先校验参数合法
@@ -188,6 +191,7 @@ def reset(strategy: str = "regime_momentum", params: dict | None = None,
                  ("cash", cash), ("initial_cash", cash),
                  ("max_positions", max_positions), ("top", top),
                  ("max_hold_days", max_hold_days),
+                 ("renew_ranked", int(bool(renew_ranked))),
                  ("last_date", ""), ("created_at",
                                      datetime.now().strftime("%Y-%m-%d %H:%M:%S"))]:
         _set(k, v, account=account)
@@ -264,6 +268,8 @@ def advance(as_of: str | None = None, verbose: bool = True,
     max_pos = int(_meta("max_positions", account=account))
     top = int(_meta("top", account=account))
     max_hold = int(_meta("max_hold_days", 0, account=account) or 0)
+    # 老账户没有这一项：按 0 处理，行为与加这个开关之前完全一致
+    renew_ranked = bool(int(_meta("renew_ranked", 0, account=account) or 0))
     holds = _holdings(account)
 
     # ---------------- 数据：股票池 + 持仓，窗口够算指标即可 ----------------
@@ -314,6 +320,16 @@ def advance(as_of: str | None = None, verbose: bool = True,
         v = float(b.loc[date, field])
         return v if v > 0 else None
 
+    # 到期续持的名单：与下面买入环节同一套筛选和排序，只是把已持有的也算进去。
+    # 与引擎 run() 里的 renew 逐字对应（自检「逐笔等价」盯着两边）。
+    renew = None
+    if renew_ranked and max_hold > 0 and regime_on:
+        elig = [(v["score"], c) for c, v in sig.items()
+                if v["entry"] and px_at(c, as_of, "open") is not None
+                and px_at(c, prev, "close") is not None]
+        elig.sort(key=lambda x: -x[0] if x[0] == x[0] else 9e9)
+        renew = {c for _, c in elig[:max_pos]}
+
     # ---------------- 1. 卖出 ----------------
     for code in list(holds):
         h = holds[code]
@@ -328,6 +344,9 @@ def advance(as_of: str | None = None, verbose: bool = True,
         # 到期调仓：growth_value 这类策略 exit() 恒为 False，靠持有期上限重排。
         # 没有这一条，它会买满仓位后永远不动——不报错，只是从此不再是那个策略。
         expired = max_hold > 0 and h["hold_days"] >= max_hold
+        if expired and not s["exit"] and renew is not None and code in renew:
+            h["hold_days"] = 0                       # 仍在前 N 名：续持，重新计时
+            continue
         if not s["exit"] and not expired:
             continue
         if o <= pc * (1 - price_limit(code, h["name"])) + EPS:
@@ -526,6 +545,7 @@ def status(account: str = DEFAULT_ACCOUNT) -> dict:
            "max_positions": int(_meta("max_positions", 5, account=account) or 5),
            "top": int(_meta("top", 400, account=account) or 400),
            "max_hold_days": int(_meta("max_hold_days", 0, account=account) or 0),
+           "renew_ranked": bool(int(_meta("renew_ranked", 0, account=account) or 0)),
            "created_at": _meta("created_at", account=account),
            "last_date": _meta("last_date", account=account),
            "days": len(eq), "holdings": hold.to_dict("records"),
@@ -614,7 +634,8 @@ def decay_report(account: str = DEFAULT_ACCOUNT, min_days: int = 20,
     strat = get_strategy(st["strategy"], **st["params"])
     cfg = engine.BacktestConfig(initial_cash=st["initial_cash"],
                                 max_positions=st["max_positions"],
-                                max_hold_days=st["max_hold_days"])
+                                max_hold_days=st["max_hold_days"],
+                                renew_ranked=st["renew_ranked"])
     r = engine.run(strat, codes, hist_start, hist_end, cfg, names)
     if r.equity.empty:
         return {"enough": False,

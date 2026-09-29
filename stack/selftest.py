@@ -302,7 +302,8 @@ def _paper_vs_engine(strategy: str, params: dict, cfg: engine.BacktestConfig,
     uni_mod.build = lambda flt=None, as_of=None: fdf
     try:
         paper.reset(strategy, params, cfg.initial_cash, cfg.max_positions,
-                    top, cfg.max_hold_days, account=SELFTEST_ACCOUNT)
+                    top, cfg.max_hold_days, account=SELFTEST_ACCOUNT,
+                    renew_ranked=cfg.renew_ranked)
         for d in store.trading_days(start=start, end=end):
             paper.advance(as_of=d, verbose=False, account=SELFTEST_ACCOUNT)
         with store.connect() as c:
@@ -356,13 +357,20 @@ def _t_paper_equiv():
             initial_cash=200_000, max_positions=5)),
         ("growth_value", {}, engine.BacktestConfig(
             initial_cash=200_000, max_positions=5, max_hold_days=5)),
+        # 到期续持：两边各自算一份「前 N 名」，筛选或排序差一点就会分叉
+        ("growth_value", {}, engine.BacktestConfig(
+            initial_cash=200_000, max_positions=5, max_hold_days=5,
+            renew_ranked=True)),
     ]
 
-    notes = []
+    notes, counts = [], {}
     try:
         for name, params, cfg in cases:
+            tag = name + ("+续持" if cfg.renew_ranked else "")
             et, pt = _paper_vs_engine(name, params, cfg, fdf, codes, names,
                                       eng_start, start, end, 150)
+            counts[tag] = len(et)
+            name = tag
             if et.empty and pt.empty:
                 notes.append(f"{name} 区间内无交易")
                 continue
@@ -376,6 +384,11 @@ def _t_paper_equiv():
     finally:
         # 只清自己的账户；用户的前向记录自始至终没被碰过
         paper.drop_account(SELFTEST_ACCOUNT)
+    plain, renew = counts.get("growth_value"), counts.get("growth_value+续持")
+    if plain is not None and renew is not None:
+        assert renew <= plain, f"开了续持反而多交易：{renew} > {plain}"
+        notes.append(f"续持省掉 {plain - renew} 笔" if renew < plain
+                     else "区间内未触发续持（等价性仍成立，但这一段没测到续持分支）")
     return "；".join(notes)
 
 
@@ -630,6 +643,10 @@ def _t_sync_behind():
     complete = store.last_complete_day()
     if not complete:
         return "跳过：没有完整交易日"
+    # 目标日与 sync_daily 同口径：沪深300 最后一根与最后完整交易日取较新的。
+    # 只按 last_complete_day 算的话，指数已经同步到今天、个股还没同步时，
+    # 期望值会严重偏小（实测 11 只 vs 实际落后 3910 只），检查自己先错了。
+    target = max(d for d in (complete, source._index_last_date()) if d)
 
     def stop():
         return True
@@ -640,7 +657,7 @@ def _t_sync_behind():
     inst = store.load_instruments()
     alive = inst[inst["status"].fillna("listed") != "delisted"]["code"].tolist()
     last = store.last_dates()
-    want = len([c for c in alive if last.get(c, "") < complete])
+    want = len([c for c in alive if last.get(c, "") < target])
 
     # 不做精确相等：后台跑着同步时 last_dates 每秒都在变，算期望值和 sync_daily
     # 算待更新名单不在同一瞬间，实测差过 32 只。那种假失败比不检查更糟。
@@ -885,14 +902,25 @@ def _t_partial_tail():
         return "跳过：交易日不足"
     counts = sorted(n for _, n in rows)
     med = counts[len(counts) // 2]
+    ratio = store.COMPLETE_RATIO
+
+    # 构造数据：同步跑了一半的残日必须被识别。2026-09-22 实测当日 2384/4564（52%），
+    # 旧阈值 0.5 让它压线通过，信号从半个市场里选股。
+    fake = [("D4", 2384), ("D3", 4564), ("D2", 4566), ("D1", 4562), ("D0", 4570)]
+    assert store.pick_complete_day(fake) == "D3", (
+        f"52% 的残日被当成完整交易日（阈值 {ratio}）")
+    fake_ok = [("D4", 4540), ("D3", 4564), ("D2", 4566), ("D1", 4562), ("D0", 4570)]
+    assert store.pick_complete_day(fake_ok) == "D4", "正常波动（少几十只）被误判成残日"
 
     complete = store.last_complete_day()
     assert complete is not None, "last_complete_day 不应为空"
     got = dict(rows)[complete]
-    assert got >= med * 0.5,         f"选中的 {complete} 只有 {got} 行，不到近期中位数 {med} 的一半"
+    assert got >= med * ratio, (
+        f"选中的 {complete} 只有 {got} 行，不到近期中位数 {med} 的 {ratio:.0%}")
 
     used, _ = sig_mod._latest_usable_date()
-    assert used is None or dict(rows).get(used, med) >= med * 0.5,         f"每日信号用了残日 {used}（{dict(rows).get(used)} 行，中位数 {med}）"
+    assert used is None or dict(rows).get(used, med) >= med * ratio, (
+        f"每日信号用了残日 {used}（{dict(rows).get(used)} 行，中位数 {med}）")
 
     # 回补路径（--since / 建账户）用显式 as_of 推进，曾经绕过上面这层保护：
     # trading_days() 里库尾那几个残日会被一并推进，照残缺名单建仓，不报错。
@@ -966,6 +994,118 @@ def _t_partial_bar():
         f"已收盘且库尾完整，应当直接用 {days[-1]}，"
         f"实际 as_of={as_of}、skipped={skipped}")
     return f"使用 {as_of}（已收盘或非交易日）"
+
+
+@check("同步：除权检测——重叠日价格对不上必须判为口径变了，噪声不能误判")
+def _t_adjust_detect():
+    """增量同步只重拉 7 天，除权后前复权把整段历史都改了，库里 7 天以前还是旧口径，
+    留下假跳空。检测靠重叠日收盘价的比值：同源同精度时逐位相等，
+    BaoStock 补过的日子有 ±0.1% 差异，真除权通常是 1% 以上。"""
+    from .data import source
+    dates = ["2026-09-14", "2026-09-15", "2026-09-16", "2026-09-17"]
+    db = pd.DataFrame({"date": dates, "close": [10.00, 10.20, 9.90, 10.05]})
+
+    same = db.copy()
+    assert source.basis_ratio(db, same) == 1.0
+    assert not source._basis_moved(source.basis_ratio(db, same)), "口径没变却判成除权"
+
+    noisy = db.assign(close=db["close"] * np.array([1.001, 0.999, 1.0008, 0.9993]))
+    assert not source._basis_moved(source.basis_ratio(db, noisy)), (
+        "±0.1% 的跨源噪声被误判成除权——BaoStock 补过的股票会被反复整只重建")
+
+    moved = db.assign(close=db["close"] * 0.95)
+    assert source._basis_moved(source.basis_ratio(db, moved)), "整体偏 5% 却没判出除权"
+
+    other = pd.DataFrame({"date": ["2026-09-18"], "close": [9.5]})
+    assert source.basis_ratio(db, other) is None, "没有重叠日时不该给出比值"
+    assert not source._basis_moved(None)
+    return f"容差 ±{source.ADJ_TOLERANCE:.1%}：一致/噪声/偏 5%/无重叠 四种情况判对"
+
+
+@check("同步：腾讯分段拉取任何一段失败必须整只失败，不能拼出半截历史")
+def _t_tencent_segments():
+    """全量历史要分 5 段左右拉。曾经跳过失败段、把其余几段拼起来返回——
+    中间一段被限流时，历史少一截照样写库，缺口里留着旧口径的老数据，不报错。"""
+    from .data import source
+    orig = source._fetch_tencent_span
+    ok = pd.DataFrame({"date": ["2020-01-02"], "open": [1.0], "high": [1.0],
+                       "low": [1.0], "close": [1.0], "volume": [1.0], "code": ["000001"],
+                       "pct_chg": [0.0], "amount": [100.0], "turnover": [pd.NA]})
+    bad = pd.DataFrame()
+    bad.attrs["error"] = "HTTPError 501: Not Implemented"
+    calls = iter([ok, bad, ok, ok, ok, ok, ok, ok])
+    try:
+        source._fetch_tencent_span = lambda *a, **k: next(calls)
+        got = source._fetch_tencent("000001", "2018-01-01", "2026-09-24")
+    finally:
+        source._fetch_tencent_span = orig
+    assert got.empty, f"一段失败仍返回了 {len(got)} 行拼接数据"
+    assert "501" in str(got.attrs.get("error")), (
+        f"失败原因没带出来：{got.attrs.get('error')!r}——界面上又只剩「全部失败」")
+    return "中间一段 501 → 整只失败，原因带出"
+
+
+@check("同步：BaoStock 换算到腾讯口径（成交量 ÷100、停牌行去掉）")
+def _t_baostock_norm():
+    """BaoStock 的 volume 是股、腾讯是手，差 100 倍（实测 60 只 × 7 天比值恰为 100.00）。
+    不换算的话同一只股票前后两段成交量差两个数量级，量比类指标全错，不报错。"""
+    from .data import source
+    raw = pd.DataFrame({
+        "date": ["2026-09-23", "2026-09-22", "2026-09-24"],
+        "open": [10.0, 9.8, 10.2], "high": [10.3, 10.0, 10.4],
+        "low": [9.9, 9.7, 10.1], "close": [10.1, 9.9, 10.3],
+        "volume": [1_000_000.0, 0.0, 2_000_000.0], "amount": [1.01e7, 0.0, 2.06e7],
+        "tradestatus": ["1", "0", "1"], "code": ["000001"] * 3})
+    got = source._normalize_baostock(raw)
+    assert list(got["date"]) == ["2026-09-23", "2026-09-24"], "停牌行没去掉或没按日期排序"
+    assert list(got["volume"]) == [10_000.0, 20_000.0], f"volume 没换成手：{list(got['volume'])}"
+    exp_amt = [10_000.0 * 100 * 10.1, 20_000.0 * 100 * 10.3]
+    assert np.allclose(got["amount"], exp_amt), "amount 没按腾讯估算式重算"
+    assert abs(got["pct_chg"].iloc[1] - (10.3 / 10.1 - 1) * 100) < 1e-9
+    return "volume ÷100、amount 同口径、停牌行已去掉"
+
+
+@check("同步：取消信号在一轮进行中也能叫停，不再发出请求")
+def _t_sync_cancel():
+    """以前只在两轮之间查一次取消：实测看门狗 250s 前就判定被封，
+    同步照样把 4570 只跑完。这里第一轮开始后立刻叫停，同步不能调用 fetch_daily。"""
+    from .data import source
+    calls = {"n": 0, "fetch": 0}
+
+    def cancel():
+        calls["n"] += 1
+        return calls["n"] > 1            # 放过轮次开始前那一次，之后一律叫停
+
+    orig = source.fetch_daily
+
+    def fake_fetch(*a, **k):
+        calls["fetch"] += 1
+        return pd.DataFrame()
+    try:
+        source.fetch_daily = fake_fetch
+        st = source.sync_daily(cancel_check=cancel)
+    finally:
+        source.fetch_daily = orig
+    if st["pending"] == 0:
+        return "跳过：没有待更新的股票"
+    assert calls["fetch"] == 0, f"叫停后仍发出了 {calls['fetch']} 次请求"
+    assert st.get("cancelled"), "同步被叫停却没标记 cancelled"
+    return f"待更新 {st['pending']} 只，叫停后 0 次请求"
+
+
+@check("基本面：按披露截止日推出应有的报告期（含年报与一季报同日撞车）")
+def _t_fund_period():
+    """过期财报不报错，只会让候选名单悄悄换一份：2026-09 中报 08-31 就该用上，
+    库里一直停在一季报，换成中报后 10 只候选换掉 5 只。"""
+    from .data import fundamental as fd
+    cases = {"2026-09-28": "20260630", "2026-08-30": "20260331",
+             "2026-04-30": "20260331",     # 年报和一季报都在 4-30 生效，取更新的一季报
+             "2026-04-29": "20250930", "2026-11-01": "20260930"}
+    for day, want in cases.items():
+        got = fd.expected_period(day)
+        assert got == want, f"{day} 应有 {want}，算出来是 {got}"
+    stale = fd.staleness()
+    return "边界日期全部正确；" + (f"当前库：{stale}" if stale else "当前库的基本面是最新一期")
 
 
 # ------------------------------------------------------------------ 入口

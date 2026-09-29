@@ -121,6 +121,13 @@ def generate(strategy: Strategy, flt: universe.UniverseFilter | None = None,
         if idx_last is None or idx_last < as_of:
             regime_stale = idx_last
 
+    # 用基本面打分的策略：库里财报落后于应有的报告期时必须说出来。
+    # 过期财报不会让任何东西报错，只会让候选名单悄悄变成另一份。
+    fund_stale = None
+    if getattr(strategy, "uses_fundamentals", False):
+        from .data import fundamental
+        fund_stale = fundamental.staleness(as_of)
+
     # 打分型策略的分数要等拿齐全部候选后再横截面合成，见 blend_score_fields
     score_fields = list(getattr(strategy, "score_fields", None) or [])
     field_vals: dict[str, dict[str, float]] = {}
@@ -195,7 +202,8 @@ def generate(strategy: Strategy, flt: universe.UniverseFilter | None = None,
         "skipped_partial_bar": skipped_partial,
         "regime_on": regime_on,
         "regime_note": (
-            (f"⚠ 大盘择时依据的沪深300 数据只到 {regime_stale or '（缺失）'}，"
+            (f"⚠ {fund_stale}　" if fund_stale else "")
+            + (f"⚠ 大盘择时依据的沪深300 数据只到 {regime_stale or '（缺失）'}，"
              f"晚于当前的 {as_of}，择时判断用的是旧行情。请先跑一次"
              f"「数据管理 → 增量同步」再看信号。" if regime_stale else "")
             + ("" if regime_on else

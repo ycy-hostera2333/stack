@@ -188,6 +188,27 @@ def upsert_daily(df: pd.DataFrame) -> int:
     return len(df)
 
 
+def replace_daily(code: str, df: pd.DataFrame) -> int:
+    """整只替换：先删该股全部日线，再写入 df。同一个事务，中途失败不会留下半截。
+
+    除权后重建历史必须用这个而不是 upsert：前复权会把整段历史一起改掉，
+    upsert 只覆盖新数据里有的日子，新数据里恰好缺的那几天会留着旧口径的价格。
+    """
+    if df is None or df.empty:
+        return 0
+    cols = ["code", "date", "open", "high", "low", "close",
+            "volume", "amount", "pct_chg", "turnover"]
+    df = df.reindex(columns=cols)
+    with connect() as conn:
+        conn.execute("DELETE FROM daily WHERE code=?", (code,))
+        conn.executemany(
+            f"INSERT INTO daily ({','.join(cols)}) "
+            f"VALUES ({','.join('?' * len(cols))})",
+            _rows(df),
+        )
+    return len(df)
+
+
 def set_meta(key: str, value: str) -> None:
     with connect() as conn:
         conn.execute(
@@ -307,7 +328,30 @@ def usable_history(g: pd.DataFrame) -> pd.DataFrame:
     return g.iloc[last_bad + 1:]
 
 
-def last_complete_day(min_ratio: float = 0.5, lookback: int = 30) -> str | None:
+# 残日判据：当日条数不低于近 30 个交易日中位数的这个比例。
+#
+# 曾经是 0.5，太松：2026-09-22 同步跑了一半，当日只有 2384/4564 行（52%），
+# 照样被判成「完整」。每日信号在 3540 只的股票池里把 1675 只当成停牌静默剔除，
+# 候选是从半个市场里选出来的，全程不报错。正常交易日的条数只差几十只
+# （停复牌、新股），0.9 足以区分「正常波动」和「同步没跑完」。
+COMPLETE_RATIO = 0.9
+
+
+def pick_complete_day(rows: list[tuple[str, int]],
+                      min_ratio: float = COMPLETE_RATIO) -> str | None:
+    """从 [(日期, 条数), …]（日期降序）里挑最后一个完整交易日。纯函数，便于自检构造数据。"""
+    if not rows:
+        return None
+    counts = sorted(n for _, n in rows)
+    med = counts[len(counts) // 2]
+    for d, n in rows:                     # rows 已按日期降序
+        if n >= med * min_ratio:
+            return d
+    return None
+
+
+def last_complete_day(min_ratio: float = COMPLETE_RATIO,
+                      lookback: int = 30) -> str | None:
     """最后一个**数据完整**的交易日。
 
     中断的同步会在库尾留下只有几只股票的残日。它照样出现在 trading_days() 末尾，
@@ -318,20 +362,13 @@ def last_complete_day(min_ratio: float = 0.5, lookback: int = 30) -> str | None:
     注意这与 signals 里那个「跳过未收盘的当日 K 线」是两回事：那一条只防今天，
     这一条防的是任何时候留下的残日，哪怕它已经是几天前的事。
 
-    判据：当日条数不低于近 lookback 个交易日中位数的 min_ratio。
+    判据见 COMPLETE_RATIO。
     """
     with connect() as conn:
         rows = conn.execute(
             "SELECT date, COUNT(*) FROM daily GROUP BY date "
             "ORDER BY date DESC LIMIT ?", (lookback,)).fetchall()
-    if not rows:
-        return None
-    counts = sorted(n for _, n in rows)
-    med = counts[len(counts) // 2]
-    for d, n in rows:                     # rows 已按日期降序
-        if n >= med * min_ratio:
-            return d
-    return None
+    return pick_complete_day(rows, min_ratio)
 
 
 def trading_days(start: str | None = None, end: str | None = None) -> list[str]:
