@@ -249,30 +249,43 @@ def upsert_instruments(df: pd.DataFrame) -> int:
     return len(df)
 
 
-# 新数据里为空时保留库里原值的列。腾讯/BaoStock 的 pct_chg 是由收盘价现算的，
-# 抓回来那一段的第一行必然是空；增量同步每次往回重抓 7 天、整行覆盖，于是每同步
-# 一次，重叠窗口第一天原本好好的涨跌幅就被写成空，日积月累。
-_KEEP_IF_NULL = ("amount", "pct_chg", "turnover")
+# 新数据里为空时保留库里原值的列（成交额、换手率：腾讯源不给换手率）。
+_KEEP_IF_NULL = ("amount", "turnover")
+# pct_chg 单独处理。腾讯/BaoStock 的 pct_chg 由收盘价现算，抓回来那段的第一行必然为空；
+# 增量同步每次往回重抓 7 天、整行覆盖，于是每同步一次，重叠窗口第一天原本正确的值
+# 就被写成空。这里新值为空时，用库里**前一根**的收盘价现算——不是简单保留旧值：
+# 那一行可能是盘中写进去的残缺 K 线，旧的涨跌幅是按盘中价算的，收盘价已经变了。
+# （同一批里新插入的行用不到这条：只有和库里已有行冲突时才走 DO UPDATE。）
+_PCT_FROM_PREV = ("COALESCE(excluded.pct_chg, ("
+                  "SELECT (excluded.close / p.close - 1) * 100 FROM daily AS p "
+                  "WHERE p.code = excluded.code AND p.date < excluded.date AND p.close > 0 "
+                  "ORDER BY p.date DESC LIMIT 1))")
 
 
 def upsert_daily(df: pd.DataFrame) -> int:
     """写入日线。重复的 (code,date) 覆盖，便于修正复权后的历史价格。
 
-    价格、成交量整行以新数据为准；_KEEP_IF_NULL 里的列新数据为空时保留原值。
+    价格、成交量整行以新数据为准；成交额、换手率新数据为空时保留原值；
+    涨跌幅新数据为空时按库里前一根收盘价现算（见 _PCT_FROM_PREV）。
     """
     if df is None or df.empty:
         return 0
     cols = ["code", "date", "open", "high", "low", "close",
             "volume", "amount", "pct_chg", "turnover"]
     df = df.reindex(columns=cols)
-    sets = ", ".join(
-        f"{c}=COALESCE(excluded.{c}, daily.{c})" if c in _KEEP_IF_NULL
-        else f"{c}=excluded.{c}" for c in cols[2:])
+
+    def _set(c: str) -> str:
+        if c == "pct_chg":
+            return f"pct_chg={_PCT_FROM_PREV}"
+        if c in _KEEP_IF_NULL:
+            return f"{c}=COALESCE(excluded.{c}, daily.{c})"
+        return f"{c}=excluded.{c}"
+
     with connect() as conn:
         conn.executemany(
             f"INSERT INTO daily ({','.join(cols)}) "
             f"VALUES ({','.join('?' * len(cols))}) "
-            f"ON CONFLICT(code, date) DO UPDATE SET {sets}",
+            f"ON CONFLICT(code, date) DO UPDATE SET {', '.join(_set(c) for c in cols[2:])}",
             _rows(df),
         )
     return len(df)
@@ -281,7 +294,7 @@ def upsert_daily(df: pd.DataFrame) -> int:
 def repair_pct_chg(codes: Sequence[str] | None = None) -> int:
     """把 pct_chg 为空、前一根收盘价已知的行补上（前复权收盘价的日涨幅）。
 
-    补的是增量同步留下的空洞（见 _KEEP_IF_NULL）。逐只股票各开一个事务：
+    补的是增量同步留下的空洞（见 _PCT_FROM_PREV）。逐只股票各开一个事务：
     一条 UPDATE 扫全表会长时间占着写锁，模拟盘推进等 30 秒就会报「database is locked」。
     每只股票上市第一天本来就没有前收，留空。返回补上的行数。
     """

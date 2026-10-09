@@ -372,7 +372,8 @@ def advance(as_of: str | None = None, verbose: bool = True,
             continue
         if not s["exit"] and not expired:
             continue
-        if hit_limit_down(o, pc, price_limit(code, h["name"])):
+        if hit_limit_down(o, pc, price_limit(code, h["name"]),
+                          px_at(code, as_of, "low")):
             events["blocked"].append(f"{code} {h['name']} 开盘跌停，卖不出")
             continue
         gross = o * h["shares"]
@@ -411,7 +412,8 @@ def advance(as_of: str | None = None, verbose: bool = True,
             if o is None or pc is None:
                 continue
             name = names.get(code, code)
-            if hit_limit_up(o, pc, price_limit(code, name)):
+            if hit_limit_up(o, pc, price_limit(code, name),
+                            px_at(code, as_of, "high")):
                 events["blocked"].append(f"{code} {name} 开盘涨停，买不进")
                 continue
             shares = int(budget / o // LOT_SIZE) * LOT_SIZE

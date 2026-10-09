@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from . import indicators as ind
-from .config import limit_margin, limit_price, price_limit
+from .config import LIMIT_ADJ_TOL, LIMIT_MARGIN, limit_price, price_limit
 from .data import store, universe
 
 REGISTRY: dict[str, "Factor"] = {}
@@ -75,12 +75,19 @@ def forward_return(P: dict, horizon: int) -> pd.DataFrame:
 
 def tradable_mask(P: dict) -> pd.DataFrame:
     """t+1 日能否真正买进。剔除停牌和开盘涨停——信号再好也买不到。"""
-    o, c = P["open"], P["close"]
+    # 面板是 float32，舍入到分之前先转回 float64 并抹掉 float32 的尾差：
+    # 1.05 存成 float32 是 1.0499999…，涨停价会被算成 1.15 而不是 1.16
+    o = P["open"].astype("float64").round(4)
+    c = P["close"].astype("float64").round(4)
     nxt_open = o.shift(-1)
+    nxt_high = P["high"].astype("float64").round(4).shift(-1)
     limit = pd.Series([price_limit(x) for x in o.columns], index=o.columns,
                       dtype="float64")
-    # 口径与引擎一致，见 config.limit_price：涨停价按交易所规则四舍五入到分
-    up = nxt_open >= limit_price(c, limit, True) - limit_margin(c)
+    # 两道判据与引擎相同，见 config.hit_limit_up：精确涨停价，或「开盘即最高」且贴近涨停
+    m_exact = np.minimum(LIMIT_MARGIN[0], LIMIT_MARGIN[1] * c)
+    m_adj = np.minimum(LIMIT_ADJ_TOL[0], LIMIT_ADJ_TOL[1] * c)
+    up = ((nxt_open >= limit_price(c, limit, True) - m_exact)
+          | ((nxt_open >= nxt_high - 1e-9) & (nxt_open >= c * (1 + limit) - m_adj)))
     return nxt_open.notna() & c.notna() & ~up
 
 

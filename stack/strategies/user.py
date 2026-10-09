@@ -482,6 +482,7 @@ def save(name: str, label: str, description: str, code: str,
     register_class(cls, slug, label)
     store.upsert_user_strategy(slug, label, description, code)
     load_errors.pop(slug, None)
+    load_warnings.pop(slug, None)      # 刚过完体检，启动时那次试跑的警告已经过时
     rep.update(saved=True, label=label, description=description)
     return rep
 
@@ -504,6 +505,7 @@ def remove(name: str, force: bool = False) -> dict:
     store.delete_user_strategy(name)
     REGISTRY.pop(name, None)
     load_errors.pop(name, None)
+    load_warnings.pop(name, None)
     return {"ok": True}
 
 

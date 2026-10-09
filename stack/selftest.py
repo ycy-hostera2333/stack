@@ -104,6 +104,13 @@ def _t_cost():
         assert hit_limit_down(px, pc, lim), f"前收 {pc} 开 {px} 是跌停，没判出来"
     for px, pc, lim in ((9.13, 10.13, .10), (9.15, 10.16, .10), (9.01, 10.00, .10)):
         assert not hit_limit_down(px, pc, lim), f"前收 {pc} 开 {px} 差一分到跌停，被当成了跌停"
+    # 前复权的历史价是「原始价 × 复权因子」再取到分，按复权价重算涨停价会差出一两分：
+    # 10 转 5 之后，原始 5.02 → 5.52 的涨停存成 3.35 → 3.68。只看精确价会漏掉，
+    # 第二道判据（开盘即最高/最低）必须接住；盘中还更高/更低的就不是一字板，不能挡
+    assert hit_limit_up(3.68, 3.35, .10, high=3.68), "前复权价上的涨停（开盘即最高）没判出来"
+    assert hit_limit_down(3.03, 3.36, .10, low=3.03), "前复权价上的跌停（开盘即最低）没判出来"
+    assert not hit_limit_up(10.99, 10.00, .10, high=11.00), "差一分且盘中更高的开盘被当成了涨停"
+    assert not hit_limit_down(9.01, 10.00, .10, low=9.00), "差一分且盘中更低的开盘被当成了跌停"
     return "含 ST/板块涨跌停、涨跌停价舍入到分"
 
 
@@ -1264,7 +1271,19 @@ def _t_keep_pct_chg():
         with store.connect() as c:
             v = c.execute("SELECT pct_chg FROM daily WHERE code=? AND date='2020-01-03'",
                           (code,)).fetchone()[0]
-            assert v == 5.0, f"已有的涨跌幅 5.0 被增量写入覆盖成了 {v}"
+            assert v is not None and abs(v - 5.0) < 1e-9, (
+                f"已有的涨跌幅 5.0 被增量写入覆盖成了 {v}")
+        # 那一行若是盘中写进去的残缺 K 线（收盘价后来变了），不能保留按盘中价算的旧涨跌幅
+        fixed = rows.iloc[1:].copy()
+        fixed["close"] = [10.6, 10.29]
+        fixed["pct_chg"] = [None, -2.92]
+        store.upsert_daily(fixed)
+        with store.connect() as c:
+            v = c.execute("SELECT pct_chg FROM daily WHERE code=? AND date='2020-01-03'",
+                          (code,)).fetchone()[0]
+            assert v is not None and abs(v - 6.0) < 1e-9, (
+                f"收盘价从 10.5 改成 10.6 之后，涨跌幅应按前收 10.0 算成 6.0，实际 {v}")
+            c.execute("UPDATE daily SET close=10.5 WHERE code=? AND date='2020-01-03'", (code,))
             c.execute("UPDATE daily SET pct_chg=NULL WHERE code=?", (code,))
         n = store.repair_pct_chg([code])
         with store.connect() as c:
@@ -1277,7 +1296,7 @@ def _t_keep_pct_chg():
     finally:
         with store.connect() as c:
             c.execute("DELETE FROM daily WHERE code=?", (code,))
-    return "重叠窗口首行的空值不再覆盖原值；空洞按收盘价补回，首日留空"
+    return "重叠窗口首行按前收现算（含盘中残缺行被修正）；空洞按收盘价补回，首日留空"
 
 
 @check("缓存：别的连接写入之后，行情与交易日历缓存必须立刻失效")

@@ -110,7 +110,7 @@ class Panel:
     候选筛选还能整列向量化，实测快一个数量级以上。
     """
 
-    __slots__ = ("codes", "idx", "dates", "open", "high", "close",
+    __slots__ = ("codes", "idx", "dates", "open", "high", "low", "close",
                  "atr", "entry", "exit", "score", "valid")
 
     def __init__(self, codes, dates, arrays):
@@ -149,7 +149,7 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
     n_d = len(dates)
     keep_codes: list[str] = []
     cols: dict[str, list[np.ndarray]] = {
-        k: [] for k in ("open", "high", "close", "atr", "score")}
+        k: [] for k in ("open", "high", "low", "close", "atr", "score")}
     flags: dict[str, list[np.ndarray]] = {k: [] for k in ("entry", "exit", "valid")}
     # 多因子打分声明的原始列，逐股票收集，最后由引擎做横截面归一
     score_cols = [n for n, _ in getattr(strategy, "score_fields", []) or []]
@@ -187,9 +187,10 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
         # 比涨跌停判定的容差还粗，一字涨停会被判成「没到涨停」而照样买入；
         # 成交价、盈亏也和模拟盘（直接读库，float64）差出几分钱。
         row = {k: np.full(n_d, np.nan, dtype=np.float64)
-               for k in ("open", "high", "close", "atr", "score")}
+               for k in ("open", "high", "low", "close", "atr", "score")}
         row["open"][pos] = d["open"].to_numpy()[sel]
         row["high"][pos] = d["high"].to_numpy()[sel]
+        row["low"][pos] = d["low"].to_numpy()[sel]
         row["close"][pos] = d["close"].to_numpy()[sel]
         # 策略可以声明不需要 atr14（见 Strategy.indicators）。这里留 NaN，
         # 由 run() 在开跑前挡住"要用跟踪止损却没有 ATR"的组合——
@@ -434,7 +435,7 @@ def run(strategy: Strategy, codes: list[str], start: str, end: str,
                 # 买入侧已有同样的守卫，卖出侧不能漏——负价格会算出负的卖出所得。
                 skipped["停牌"] += 1
                 continue
-            if hit_limit_down(px, prev_close, limits[i]):
+            if hit_limit_down(px, prev_close, limits[i], float(P.low[i, j])):
                 skipped["跌停无法卖出"] += 1
                 continue
 
@@ -481,7 +482,8 @@ def run(strategy: Strategy, codes: list[str], start: str, end: str,
                     px, prev_close = float(op_t[i]), float(cl_p[i])
                     if px <= 0:
                         continue
-                    if hit_limit_up(px, prev_close, limits[i]):   # 一字涨停买不到
+                    if hit_limit_up(px, prev_close, limits[i],   # 一字涨停买不到
+                                    float(P.high[i, j])):
                         skipped["涨停无法买入"] += 1
                         continue
 
