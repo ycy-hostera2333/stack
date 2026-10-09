@@ -51,7 +51,12 @@ BUILTIN_HEADER = '''"""从内置策略复制出来的模板。
 df 里已经备好的指标列见 indicators.add_common：
   ma5/10/20/60/120、vol_ma20、vol_ratio、rsi14、atr14、atr_pct、
   high20、low20、dd、mom20/60/120、vol20
-需要 MACD/布林带/MA250 时覆写 prepare() 调 ind.add_extended(super().prepare(df))。
+需要 MACD/布林带/MA250 时覆写 prepare() 调 ind.add_extended(super().prepare(df))；
+别的周期的均线/动量用 ind.add_periods(df, ma=(30,), mom=(90,))。
+
+⚠ 下面的 `indicators = (...)` 只让 df 里出现这个策略自己用到的那几列（为了快）。
+改成用别的列时，把列名加进去，或者整行删掉恢复成全部都算。
+
 
 entry/exit/score 只允许使用当日及之前的信息——用了未来数据，
 回测会假得离谱，而且保存时会直接被拒。

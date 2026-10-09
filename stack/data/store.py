@@ -5,7 +5,10 @@
 """
 from __future__ import annotations
 
+import bisect
 import sqlite3
+import threading
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Iterable, Sequence
@@ -110,6 +113,48 @@ def connect():
         conn.commit()
     finally:
         conn.close()
+
+
+# ------------------------------------------------------------------ 读缓存
+# 回测/信号/模拟盘读的都是同一份行情，而读一次全市场是整个流程里最慢的一步
+# （150 万行约 4-8 秒，大头在 sqlite 逐行转 Python 对象，换表结构也省不下来）。
+# 网页上改个参数重跑回测，股票池和区间都没变，却要把同样的数据再读一遍。
+#
+# 失效判据用 SQLite 自己的 PRAGMA data_version：在一条常驻连接上反复查询，
+# 只要**任何其他连接**（包括别的进程，比如另开的命令行同步）提交过写入，
+# 返回值就会变。比文件修改时间可靠——WAL 文件在检查点之后是原地覆写的，
+# 大小不变，修改时间在一些文件系统上又只有毫秒级精度。
+_watch_lock = threading.Lock()
+_watch: dict = {"conn": None}
+
+
+def data_version() -> int:
+    """库内容的版本号：任何连接提交写入后都会变。只用来判断缓存是否过期。"""
+    with _watch_lock:
+        c = _watch["conn"]
+        if c is None:
+            c = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+            _watch["conn"] = c
+        try:
+            return int(c.execute("PRAGMA data_version").fetchone()[0])
+        except sqlite3.Error:
+            # 库文件被换掉之类的异常情况：丢掉这条连接，本次视为「已变化」
+            _watch["conn"] = None
+            c.close()
+            return -1
+
+
+_CACHE_MAX = 2                 # 一份全市场日线约 100+MB，只留最近两份
+_CACHE_MIN_CODES = 100         # 小查询（单只、指数、几十只）本来就快，不缓存
+_daily_cache: OrderedDict = OrderedDict()
+_cache_lock = threading.Lock()
+_days_cache: dict = {}
+
+
+def clear_cache() -> None:
+    with _cache_lock:
+        _daily_cache.clear()
+        _days_cache.clear()
 
 
 def init_db() -> None:
@@ -286,12 +331,36 @@ def load_daily(
     （2438 只 / 600 天：IN 子句 3.2s，日期索引 13.6s），因为后者要先读出全市场的行。
     (code,date) 主键在这里已经够用，维持 IN 子句。
     """
-    sql = "SELECT * FROM daily WHERE 1=1"
-    params: list = []
     if codes is not None:
         codes = list(codes)
         if not codes:
             return pd.DataFrame()
+    big = codes is None or len(codes) >= _CACHE_MIN_CODES
+    if big:
+        key = (tuple(codes) if codes is not None else None, start, end)
+        ver = data_version()
+        with _cache_lock:
+            hit = _daily_cache.get(key)
+            if hit is not None and hit[0] == ver and ver >= 0:
+                _daily_cache.move_to_end(key)
+                # 给副本：调用方可以随意改列（api 的回放接口就会改 date 列）
+                return hit[1].copy()
+    df = _load_daily_sql(codes, start, end)
+    if big and ver >= 0:
+        with _cache_lock:
+            _daily_cache[key] = (ver, df)
+            _daily_cache.move_to_end(key)
+            while len(_daily_cache) > _CACHE_MAX:
+                _daily_cache.popitem(last=False)
+        return df.copy()
+    return df
+
+
+def _load_daily_sql(codes: list[str] | None, start: str | None,
+                    end: str | None) -> pd.DataFrame:
+    sql = "SELECT * FROM daily WHERE 1=1"
+    params: list = []
+    if codes is not None:
         sql += f" AND code IN ({','.join('?' * len(codes))})"
         params += codes
     if start:
@@ -304,7 +373,8 @@ def load_daily(
     with connect() as conn:
         df = pd.read_sql(sql, conn, params=params)
     if not df.empty:
-        df["date"] = pd.to_datetime(df["date"])
+        # 显式给格式：不给的话 pandas 要逐个推断，全市场一次慢 2-3 倍
+        df["date"] = pd.to_datetime(df["date"], format="%Y-%m-%d")
     return df
 
 
@@ -321,11 +391,38 @@ def usable_history(g: pd.DataFrame) -> pd.DataFrame:
     """
     if g.empty:
         return g
-    bad = (g["close"] <= 0) | (g["low"] <= 0) | (g["open"] <= 0)
+    # 走 numpy：逐只调用，三次 pandas 比较 + 或运算的固定开销比计算本身大得多
+    bad = ((g["close"].to_numpy() <= 0) | (g["low"].to_numpy() <= 0)
+           | (g["open"].to_numpy() <= 0))
     if not bad.any():
         return g
-    last_bad = np.flatnonzero(bad.to_numpy())[-1]
+    last_bad = np.flatnonzero(bad)[-1]
     return g.iloc[last_bad + 1:]
+
+
+def iter_stocks(raw: pd.DataFrame):
+    """逐只产出 (代码, 按日期升序且截掉负价前缀的日线)。
+
+    引擎、模拟盘、每日信号、因子面板原来各写一遍
+    `for code, g in raw.groupby("code"): usable_history(g.sort_values("date"))`。
+    load_daily 返回的本来就按 (code, date) 排好序，这里直接按代码边界切片，
+    省掉 groupby 和每只一次的排序；万一传进来的没排序，退回原来的做法。
+    每只给的是副本：策略的 prepare() 原地改列不会写回调用方的大表。
+    """
+    if raw is None or raw.empty:
+        return
+    codes = raw["code"].to_numpy()
+    if not pd.Index(codes).is_monotonic_increasing:
+        for code, g in raw.groupby("code", sort=False):
+            yield code, usable_history(g.sort_values("date"))
+        return
+    starts = np.flatnonzero(np.r_[True, codes[1:] != codes[:-1]])
+    ends = np.r_[starts[1:], len(codes)]
+    for a, b in zip(starts, ends):
+        g = raw.iloc[a:b]
+        if not g["date"].is_monotonic_increasing:
+            g = g.sort_values("date")
+        yield codes[a], usable_history(g.copy())
 
 
 # 残日判据：当日条数不低于近 30 个交易日中位数的这个比例。
@@ -364,26 +461,42 @@ def last_complete_day(min_ratio: float = COMPLETE_RATIO,
 
     判据见 COMPLETE_RATIO。
     """
+    key = ("complete", min_ratio, lookback)
+    ver = data_version()
+    with _cache_lock:
+        hit = _days_cache.get(key)
+        if hit is not None and hit[0] == ver and ver >= 0:
+            return hit[1]
     with connect() as conn:
         rows = conn.execute(
             "SELECT date, COUNT(*) FROM daily GROUP BY date "
             "ORDER BY date DESC LIMIT ?", (lookback,)).fetchall()
-    return pick_complete_day(rows, min_ratio)
+    out = pick_complete_day(rows, min_ratio)
+    with _cache_lock:
+        _days_cache[key] = (ver, out)
+    return out
 
 
 def trading_days(start: str | None = None, end: str | None = None) -> list[str]:
-    """本地库里出现过的所有交易日。"""
-    sql = "SELECT DISTINCT date FROM daily WHERE 1=1"
-    params: list = []
-    if start:
-        sql += " AND date >= ?"
-        params.append(start)
-    if end:
-        sql += " AND date <= ?"
-        params.append(end)
-    sql += " ORDER BY date"
-    with connect() as conn:
-        return [r[0] for r in conn.execute(sql, params).fetchall()]
+    """本地库里出现过的所有交易日。
+
+    全表 DISTINCT 要扫一遍日期索引（真实库上千万行）。模拟盘逐日推进时每推一天
+    要调好几次，所以整份日历按库版本缓存一份，区间用二分切片。
+    """
+    ver = data_version()
+    with _cache_lock:
+        hit = _days_cache.get("days")
+    if hit is None or hit[0] != ver or ver < 0:
+        with connect() as conn:
+            days = [r[0] for r in conn.execute(
+                "SELECT DISTINCT date FROM daily ORDER BY date").fetchall()]
+        with _cache_lock:
+            _days_cache["days"] = (ver, days)
+    else:
+        days = hit[1]
+    lo = bisect.bisect_left(days, start) if start else 0
+    hi = bisect.bisect_right(days, end) if end else len(days)
+    return days[lo:hi]
 
 
 def coverage() -> dict:

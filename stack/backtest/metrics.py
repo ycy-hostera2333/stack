@@ -29,7 +29,8 @@ def analytics(equity: pd.DataFrame, trades: list, initial_cash: float) -> dict:
     v = eq["equity"]
 
     # ---- 回撤曲线 ----
-    dd = (v / v.cummax() - 1).round(5)
+    # 峰值从初始资金算起：首日就亏的话，那一段也是回撤（见 compute 里的说明）
+    dd = (v / np.maximum(v.cummax(), initial_cash) - 1).round(5)
 
     # ---- 月度收益（年 × 月 网格）----
     mv = v.resample("ME").last()
@@ -54,8 +55,7 @@ def analytics(equity: pd.DataFrame, trades: list, initial_cash: float) -> dict:
         if bench_series is not None and ts in bench_series.index:
             bv = float(bench_series.loc[ts])
             if bprev is None:
-                first = eq["benchmark"].ffill().dropna()
-                bprev = float(first.iloc[0]) if len(first) else bv
+                bprev = float(initial_cash)      # 基准的基期值就是初始资金
             row["bench"] = round(bv / bprev - 1, 4)
             bprev = bv
         yearly.append(row)
@@ -95,6 +95,10 @@ def compute(equity: pd.DataFrame, trades: list, initial_cash: float) -> dict:
     years = n / TRADING_DAYS
     cagr = (eq[-1] / initial_cash) ** (1 / years) - 1 if years > 0 and eq[-1] > 0 else 0.0
 
+    # 净值序列的第一行已经是首个交易日收盘后的值。把初始资金接在最前面，
+    # 首日的盈亏才会进入收益率序列和回撤——原来首日就亏 5% 的话，
+    # 那 5% 不算回撤（峰值从亏完之后起算），日收益序列也少了这一天。
+    eq = np.r_[float(initial_cash), eq]
     rets = np.diff(eq) / eq[:-1]
     rets = rets[np.isfinite(rets)]
     vol = rets.std(ddof=0) * np.sqrt(TRADING_DAYS) if len(rets) > 1 else 0.0
@@ -155,7 +159,10 @@ def compute(equity: pd.DataFrame, trades: list, initial_cash: float) -> dict:
         bm = equity["benchmark"].ffill().to_numpy(dtype=float)
         valid = np.isfinite(bm)
         if valid.sum() > 1:
-            bm = bm[valid]
+            # 引擎把基准归一到「基期 = 初始资金」，基期是首个信号日的收盘，
+            # 早于净值表第一行。从初始资金算起才和策略的 total_return 同一起点；
+            # 用 bm[0] 的话会漏掉第一天的指数涨跌。
+            bm = np.r_[float(initial_cash), bm[valid]]
             bm_ret = bm[-1] / bm[0] - 1
             bm_peak = np.maximum.accumulate(bm)
             out["benchmark_return"] = round(float(bm_ret), 4)

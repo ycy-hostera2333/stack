@@ -69,8 +69,7 @@ def _fill_display_indicators(buys: list[dict], raw: pd.DataFrame) -> None:
     if todo:
         want = [k for k, _ in _DISPLAY]
         sub = raw[raw["code"].isin([b["code"] for b in todo])]
-        for code, g in sub.groupby("code", sort=False):
-            g = store.usable_history(g.sort_values("date"))
+        for code, g in store.iter_stocks(sub):
             if len(g):
                 full[code] = ind.add_common(g, want).iloc[-1]
     for b in buys:
@@ -128,18 +127,24 @@ def generate(strategy: Strategy, flt: universe.UniverseFilter | None = None,
         from .data import fundamental
         fund_stale = fundamental.staleness(as_of)
 
-    # 打分型策略的分数要等拿齐全部候选后再横截面合成，见 blend_score_fields
+    # 打分型策略的分数要等拿齐全部股票后再横截面合成，见 blend_score_fields。
+    # 排名的总体是**当日所有算得出指标的股票**，不只是满足 entry 的那些——
+    # 引擎（_cross_rank 按全部有效股票排）和模拟盘都是这个口径。原来只在买入候选
+    # 里排：多因子各自的百分位换了一个总体，加权和的先后就可能变，信号页给出的
+    # 前几名和回测/模拟盘在同一天会买的不是同一批。
     score_fields = list(getattr(strategy, "score_fields", None) or [])
     field_vals: dict[str, dict[str, float]] = {}
 
     buys, sells, errors = [], [], 0
-    for code, g in raw.groupby("code", sort=False):
-        g = store.usable_history(g.sort_values("date"))
+    for code, g in store.iter_stocks(raw):
         if len(g) < min_bars or g["date"].iloc[-1].strftime("%Y-%m-%d") != as_of:
             continue                      # 数据不足或当日停牌
         try:
             d = strategy.prepare(g)
             row = d.iloc[-1]
+            if score_fields:
+                field_vals[code] = {col: float(row[col]) for col, _w in score_fields
+                                    if col in row.index}
             if regime_on and bool(strategy.entry(d).iloc[-1]) and code not in held_codes:
                 buys.append({
                     "code": code,
@@ -161,10 +166,7 @@ def generate(strategy: Strategy, flt: universe.UniverseFilter | None = None,
             continue
 
     if score_fields:
-        vals = {b["code"]: {col: float(b["_row"][col])
-                            for col, _w in score_fields if col in b["_row"].index}
-                for b in buys}
-        scores = blend_score_fields(vals, score_fields)
+        scores = blend_score_fields(field_vals, score_fields)
         for b in buys:
             b["score"] = scores.get(b["code"], 0.0)
     buys.sort(key=lambda x: -x["score"])

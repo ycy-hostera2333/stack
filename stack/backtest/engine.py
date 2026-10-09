@@ -5,7 +5,7 @@
 1. 信号日收盘产生信号，**次日开盘**成交。当日信号当日成交是最常见的未来函数。
 2. T+1：因为买入发生在次日开盘，卖出最早也在再下一日，天然满足。
 3. 涨跌停：次日开盘一字涨停就买不进、跌停就卖不出，按板块区分 10%/20%，ST 减半。
-4. 停牌：当日无 K 线数据即视为不可交易，持仓继续按最后价格计价。
+4. 停牌：当日无 K 线数据即视为不可交易，持仓继续按停牌前最后收盘价计价。
 5. 交易成本：佣金（含最低 5 元）、卖出印花税、过户费，买卖分别计。
 6. 100 股整手，资金不足买一手就跳过。
 
@@ -19,11 +19,10 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 
-from ..config import LOT_SIZE, buy_cost, price_limit, sell_cost
+from ..config import (LOT_SIZE, buy_cost, hit_limit_down, hit_limit_up,
+                      price_limit, sell_cost)
 from ..data import store
 from ..strategies.base import Strategy
-
-EPS = 1e-6
 
 
 @dataclass
@@ -144,7 +143,9 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
     if raw.empty:
         return None
 
-    date_pos = {d: i for i, d in enumerate(dates)}
+    # 日期轴映射用二分查找：原来每只股票都要 strftime 一遍再逐个查字典，
+    # 全市场八百只就是八百次字符串格式化 + 几十万次 Python 级查找。
+    axis = pd.to_datetime(pd.Index(dates)).to_numpy(dtype="datetime64[ns]")
     n_d = len(dates)
     keep_codes: list[str] = []
     cols: dict[str, list[np.ndarray]] = {
@@ -154,8 +155,7 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
     score_cols = [n for n, _ in getattr(strategy, "score_fields", []) or []]
     extra_lists: dict[str, list[np.ndarray]] = {n: [] for n in score_cols}
 
-    for code, g in raw.groupby("code", sort=False):
-        g = store.usable_history(g.sort_values("date"))
+    for code, g in store.iter_stocks(raw):
         if len(g) < 60:                       # 数据太短，指标算不出来
             if diag is not None:
                 diag["short"] += 1
@@ -164,7 +164,7 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
             d = strategy.prepare(g)
             entry = np.asarray(strategy.entry(d), dtype=bool)
             exit_ = np.asarray(strategy.exit(d), dtype=bool)
-            score = np.asarray(strategy.score(d), dtype=np.float32)
+            score = np.asarray(strategy.score(d), dtype=np.float64)
         except Exception as e:
             # 静默跳过：策略自己写错列名时，在这里只会表现为「没有信号」。
             # 计数留给上层，好在整个面板为空时能说清是哪种情况。
@@ -174,16 +174,19 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
             continue
 
         # 只保留落在回测区间内的行，映射到全局日期轴
-        ds = d["date"].dt.strftime("%Y-%m-%d").to_numpy()
-        pos = np.array([date_pos.get(x, -1) for x in ds])
-        sel = pos >= 0
+        dv = d["date"].to_numpy(dtype="datetime64[ns]")
+        pos = np.searchsorted(axis, dv)
+        sel = (pos < n_d) & (axis[np.minimum(pos, n_d - 1)] == dv)
         if not sel.any():
             if diag is not None:
                 diag["norows"] += 1
             continue
         pos = pos[sel]
 
-        row = {k: np.full(n_d, np.nan, dtype=np.float32)
+        # 价格必须用 float64。曾经是 float32：123 元附近的精度只有 1e-5，
+        # 比涨跌停判定的容差还粗，一字涨停会被判成「没到涨停」而照样买入；
+        # 成交价、盈亏也和模拟盘（直接读库，float64）差出几分钱。
+        row = {k: np.full(n_d, np.nan, dtype=np.float64)
                for k in ("open", "high", "close", "atr", "score")}
         row["open"][pos] = d["open"].to_numpy()[sel]
         row["high"][pos] = d["high"].to_numpy()[sel]
@@ -196,7 +199,7 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
         row["score"][pos] = score[sel]
 
         for name in score_cols:
-            arr = np.full(n_d, np.nan, dtype=np.float32)
+            arr = np.full(n_d, np.nan, dtype=np.float64)
             if name in d.columns:
                 arr[pos] = pd.to_numeric(d[name], errors="coerce").to_numpy()[sel]
             extra_lists[name].append(arr)
@@ -223,7 +226,7 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
         # 每个分量按日期逐列转成横截面百分位排名，再加权求和。
         # 这是唯一能正确归一的地方——策略里只看得到单只股票的时序，
         # 在那里做 rank 排的是时间维度且会用到未来数据。
-        total = np.zeros_like(arrays["score"], dtype=np.float32)
+        total = np.zeros_like(arrays["score"], dtype=np.float64)
         wsum = 0.0
         for name, w in fields:
             m = extra.get(name)
@@ -231,7 +234,7 @@ def _prepare_panel(strategy: Strategy, codes: list[str], start: str, end: str,
                 continue
             total += w * _cross_rank(m, arrays["valid"])
             wsum += w
-        arrays["score"] = (total / wsum if wsum else total).astype(np.float32)
+        arrays["score"] = total / wsum if wsum else total
         arrays["score"][~arrays["valid"]] = -9.9
 
     return Panel(keep_codes, dates, arrays)
@@ -272,7 +275,7 @@ def _cross_rank(mat: np.ndarray, valid: np.ndarray) -> np.ndarray:
     order -= (s.shape[0] - n_valid)[None, :]
     pct = np.where(n_valid[None, :] > 1,
                    order / np.maximum(n_valid[None, :] - 1, 1), 0.5)
-    return np.where(bad, 0.0, pct).astype(np.float32)
+    return np.where(bad, 0.0, pct)
 
 
 def _benchmark(start: str, end: str, symbol: str = "IDX000300") -> pd.Series | None:
@@ -288,7 +291,7 @@ def _benchmark(start: str, end: str, symbol: str = "IDX000300") -> pd.Series | N
 # ------------------------------------------------------------------ 主循环
 class _Position:
     __slots__ = ("i", "code", "name", "shares", "cost", "open_date",
-                 "open_reason", "peak", "hold_days")
+                 "open_reason", "peak", "hold_days", "last")
 
     def __init__(self, i, code, name, shares, cost, open_date, open_reason):
         self.i = i                    # 在 Panel 里的行号
@@ -300,6 +303,7 @@ class _Position:
         self.open_reason = open_reason
         self.peak = cost
         self.hold_days = 0
+        self.last = cost              # 最近一个有 K 线的收盘价，停牌期间按它计价
 
 
 def run(strategy: Strategy, codes: list[str], start: str, end: str,
@@ -365,7 +369,11 @@ def run(strategy: Strategy, codes: list[str], start: str, end: str,
     pct_alloc = cfg.position_pct if cfg.position_pct > 0 else 1.0 / cfg.max_positions
 
     bench = _benchmark(start, end)
-    bench_base = None
+    # 基准的起点要和净值对齐：净值从 dates[0] 收盘时的初始资金起算（第一笔成交
+    # 在 dates[1] 开盘），基准也该从 dates[0] 收盘起算。原来取 dates[1]，
+    # 首日的指数涨跌被漏掉，超额收益差出一天。
+    bench_base = (float(bench.loc[dates[0]])
+                  if bench is not None and dates[0] in bench.index else None)
 
     for j in range(1, len(dates)):
         today = dates[j]
@@ -426,7 +434,7 @@ def run(strategy: Strategy, codes: list[str], start: str, end: str,
                 # 买入侧已有同样的守卫，卖出侧不能漏——负价格会算出负的卖出所得。
                 skipped["停牌"] += 1
                 continue
-            if px <= prev_close * (1 - limits[i]) + EPS:
+            if hit_limit_down(px, prev_close, limits[i]):
                 skipped["跌停无法卖出"] += 1
                 continue
 
@@ -458,9 +466,12 @@ def run(strategy: Strategy, codes: list[str], start: str, end: str,
                 sc = np.where(np.isfinite(sc), sc, -np.inf)
                 cand = cand[np.argsort(-sc, kind="stable")]
 
-                # 每仓资金按当前总资产而非初始资金，让盈利复投
-                mv_now = sum(p.shares * float(P.close[p.i, j])
-                             for p in positions.values() if valid_t[p.i])
+                # 每仓资金按当前总资产而非初始资金，让盈利复投。
+                # 持仓按**今日开盘价**估值——下单的这一刻只知道开盘价。原来用的是
+                # 今日收盘价，等于拿收盘后才知道的数字决定开盘买多少，是一处前视；
+                # 停牌的持仓原来直接不计，总资产被低估、仓位买小。
+                mv_now = sum(p.shares * (float(op_t[p.i]) if valid_t[p.i] else p.last)
+                             for p in positions.values())
                 budget = (cash + mv_now) * pct_alloc
 
                 for ci in cand:
@@ -470,7 +481,7 @@ def run(strategy: Strategy, codes: list[str], start: str, end: str,
                     px, prev_close = float(op_t[i]), float(cl_p[i])
                     if px <= 0:
                         continue
-                    if px >= prev_close * (1 + limits[i]) - EPS:   # 一字涨停买不到
+                    if hit_limit_up(px, prev_close, limits[i]):   # 一字涨停买不到
                         skipped["涨停无法买入"] += 1
                         continue
 
@@ -500,9 +511,10 @@ def run(strategy: Strategy, codes: list[str], start: str, end: str,
             if valid_t[pos.i]:
                 c = float(P.close[pos.i, j])
                 pos.peak = max(pos.peak, c)
-                mv += pos.shares * c
-            else:
-                mv += pos.shares * pos.cost      # 停牌按成本价计
+                pos.last = c
+            # 停牌按停牌前最后收盘价计。原来按成本价：涨了 50% 的票一停牌，
+            # 净值当天就凭空回吐那 50%，复牌再跳回来——回撤、波动率、夏普全被扭曲。
+            mv += pos.shares * pos.last
         row = {"date": today, "equity": cash + mv,
                "cash": cash, "positions": len(positions)}
         if bench is not None and today in bench.index:

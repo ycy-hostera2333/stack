@@ -180,6 +180,29 @@ def add_common(df: pd.DataFrame, only=None) -> pd.DataFrame:
     return pd.concat([df, pd.DataFrame(cols, index=df.index)], axis=1)
 
 
+def add_periods(df: pd.DataFrame, ma=(), mom=()) -> pd.DataFrame:
+    """补上 add_common 没有的均线 ma{n} / 动量 mom{n} 列，已有的不重算。
+
+    参数可调的策略把周期拼进列名（df[f"ma{n}"]），而 add_common 只备了
+    5/10/20/60/120 这几档。界面上把周期调到 30，entry() 就 KeyError，
+    被引擎/信号/模拟盘三处的 except 吞掉——表现为「这组参数一个信号都没有」，
+    看着像市场没机会。在 prepare() 里调这个函数，要哪个周期就有哪个。
+    """
+    c = df["close"]
+    cols: dict[str, pd.Series] = {}
+    for n in ma:
+        name = f"ma{int(n)}"
+        if name not in df.columns and name not in cols:
+            cols[name] = sma(c, int(n))
+    for n in mom:
+        name = f"mom{int(n)}"
+        if name not in df.columns and name not in cols:
+            cols[name] = momentum(c, int(n))
+    if not cols:
+        return df
+    return pd.concat([df, pd.DataFrame(cols, index=df.index)], axis=1)
+
+
 def add_extended(df: pd.DataFrame) -> pd.DataFrame:
     """补充指标：MACD、布林带、MA250、60 日高点、5 日量均。
 

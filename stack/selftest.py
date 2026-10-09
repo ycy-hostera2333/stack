@@ -18,7 +18,7 @@ import pandas as pd
 
 from . import indicators as ind
 from .backtest import engine
-from .config import buy_cost, price_limit, sell_cost
+from .config import buy_cost, hit_limit_down, hit_limit_up, price_limit, sell_cost
 from .data import store, universe
 from .strategies import all_strategies, get_strategy
 from .strategies.base import Strategy, safe
@@ -90,7 +90,17 @@ def _t_cost():
     assert price_limit("600519") == 0.10 and price_limit("300750") == 0.20
     assert price_limit("600519", "ST某某") == 0.05, "主板 ST 涨跌停应为 5%"
     assert price_limit("300750", "ST某某") == 0.20, "创业板 ST 仍为 20%"
-    return "含 ST/板块涨跌停"
+    # 涨跌停价四舍五入到分：前收 10.13 的涨停价是 11.14（不是 11.143），
+    # 跌停价是 9.12（不是 9.117）。容差曾是 1e-6，这一半的涨跌停判不出来，
+    # 回测照样在一字板上成交。反过来也不能把差一两分的正常开盘当成涨停。
+    assert hit_limit_up(11.14, 10.13, 0.10), "向下取整的涨停价没有判成涨停"
+    assert hit_limit_up(11.15, 10.14, 0.10), "向上取整的涨停价没有判成涨停"
+    assert hit_limit_down(9.12, 10.13, 0.10), "向上取整的跌停价没有判成跌停"
+    assert hit_limit_up(24.31, 20.26, 0.20), "20% 板的涨停价没有判成涨停"
+    assert not hit_limit_up(11.12, 10.13, 0.10), "离涨停差两分的开盘被当成了涨停"
+    assert not hit_limit_up(2.19, 2.00, 0.10), "低价股差一分的开盘被当成了涨停"
+    assert not hit_limit_down(9.14, 10.13, 0.10), "离跌停差两分的开盘被当成了跌停"
+    return "含 ST/板块涨跌停、涨跌停价舍入到分"
 
 
 # ------------------------------------------------------------------ 策略
@@ -120,7 +130,21 @@ def _t_strategies():
     a = get_strategy("ma_cross", fast=5, slow=20).warmup_bars()
     b = get_strategy("ma_cross", fast=60, slow=250).warmup_bars()
     assert b > a, f"慢线变长后预热窗口没有增加（{a} -> {b}）"
-    return f"{len(infos)} 个策略"
+
+    # 周期参数可以调到 add_common 没备的档位（它只有 5/10/20/60/120）。
+    # 曾经调成 30 就 KeyError，被引擎/信号/模拟盘吞掉，表现为「一个信号都没有」。
+    from .strategies.user import sample_df
+    df = sample_df()
+    odd = [("ma_trend", {"ma_fast": 7, "ma_mid": 25, "ma_slow": 70}),
+           ("rsi_reversal", {"trend_ma": 150, "stop_ma": 40}),
+           ("momentum_rotation", {"lookback": 90, "min_ma": 30})]
+    for name, kw in odd:
+        st = get_strategy(name, **kw)
+        d = st.prepare(df)
+        for fn in (st.entry, st.exit, st.score):
+            fn(d)                     # 抛异常就是不通过
+        assert len(df) >= st.warmup_bars(), f"{name} 预热窗口超过了样本长度"
+    return f"{len(infos)} 个策略；非标准周期参数 {len(odd)} 组可用"
 
 
 @check("策略：声明了精简指标集的，信号必须与全量指标下完全一致")
@@ -136,32 +160,45 @@ def _t_indicator_subset():
         return "跳过：股票池为空"
     raw = store.load_daily(uni["code"].tolist()[:30], start=days[-400])
 
+    # 默认参数之外再测一组非标准周期：周期被拼进列名的策略，换个周期用到的列就变了
+    extra = {"ma_trend": {"ma_fast": 7, "ma_mid": 25, "ma_slow": 70},
+             "rsi_reversal": {"trend_ma": 150, "stop_ma": 40},
+             "momentum_rotation": {"lookback": 90, "min_ma": 30}}
     checked = []
     for info in all_strategies():
         name = info["name"]
-        s_min = get_strategy(name)
-        decl = getattr(s_min, "indicators", None)
-        if decl is None:
+        if getattr(get_strategy(name), "indicators", None) is None:
             continue
-        unknown = set(decl) - set(ind.COMMON_COLUMNS)
-        assert not unknown, f"{name} 声明了不存在的指标列 {sorted(unknown)}"
-
-        s_full = get_strategy(name)
-        s_full.indicators = None          # 实例级覆盖，退回全量指标
         n = 0
-        for code, g in raw.groupby("code", sort=False):
-            g = store.usable_history(g.sort_values("date"))
-            if len(g) < 130:
+        for kw in ({}, extra.get(name)):
+            if kw is None:
                 continue
-            a, b = s_min.prepare(g), s_full.prepare(g)
-            for fn in ("entry", "exit", "score"):
-                x = np.asarray(getattr(s_min, fn)(a), dtype="float64")
-                y = np.asarray(getattr(s_full, fn)(b), dtype="float64")
-                assert x.shape == y.shape, f"{name}.{fn} 长度不同"
-                assert np.allclose(x, y, equal_nan=True), (
-                    f"{name}.{fn} 在精简指标集下与全量指标不一致——"
-                    f"声明的 {sorted(decl)} 不够用")
-            n += 1
+            s_min = get_strategy(name, **kw)
+            decl = s_min.indicators
+            unknown = set(decl) - set(ind.COMMON_COLUMNS)
+            assert not unknown, f"{name} 声明了不存在的指标列 {sorted(unknown)}"
+
+            s_full = get_strategy(name, **kw)
+            s_full.indicators = None          # 实例级覆盖，退回全量指标
+            for code, g in raw.groupby("code", sort=False):
+                g = store.usable_history(g.sort_values("date"))
+                if len(g) < 130:
+                    continue
+                a, b = s_min.prepare(g), s_full.prepare(g)
+                for fn in ("entry", "exit", "score"):
+                    x = np.asarray(getattr(s_min, fn)(a), dtype="float64")
+                    y = np.asarray(getattr(s_full, fn)(b), dtype="float64")
+                    assert x.shape == y.shape, f"{name}.{fn} 长度不同"
+                    assert np.allclose(x, y, equal_nan=True), (
+                        f"{name}{kw or ''}.{fn} 在精简指标集下与全量指标不一致——"
+                        f"声明的 {sorted(decl)} 不够用")
+                # reason() 也只能用声明过的列：每日信号里它在 try 里，缺列会让
+                # 整只股票被静默跳过；模拟盘里它不在 try 里，缺列会让当天推进失败
+                for act in ("BUY", "SELL"):
+                    assert (s_min.reason(a.iloc[-1], act)
+                            == s_full.reason(b.iloc[-1], act)), (
+                        f"{name}.reason({act}) 在精简指标集下与全量不一致")
+                n += 1
         assert n >= 5, f"{name} 只比对到 {n} 只，样本太少，说明不了问题"
         checked.append(f"{name} {len(decl)}/{len(ind.COMMON_COLUMNS)} 列 × {n} 只")
     if not checked:
@@ -253,19 +290,76 @@ def _t_cost_model():
             return pd.Series(0.0, index=df.index)
 
     START, END = "2022-01-01", "2024-12-31"
-    cfg = engine.BacktestConfig(initial_cash=20_000_000, max_positions=150)
-    r = engine.run(BuyHold(), codes, START, END, cfg, names)
+    raw = store.load_daily(codes=codes, start=START, end=END)
+    first = raw["date"].min()
+    # 两边必须是同一篮子股票：只取区间首日就在交易、且数据够长的，引擎也只喂这些、
+    # 仓位数设成只数，保证一只不落全部买下。原来引擎最多持 150 只、实际等权却按
+    # 全部 200 只算——个股分化大的时候，两个平均数本来就不是一回事，误报「成本模型有误」。
+    groups = {c: g.sort_values("date") for c, g in raw.groupby("code")}
+    basket = [c for c, g in groups.items() if len(g) > 200 and g["date"].iloc[0] == first]
+    if len(basket) < 40:
+        return "跳过：区间内完整的股票不足"
+    # 资金给足：每只 1000 万，一手几千元的整手取整误差 < 0.1%。每只只分 10 万的时候，
+    # 60 元的票一手 6000 元，取整让各股权重差出好几个百分点，个股分化一大，
+    # 「等权平均」和「实际买到的组合」就不是一回事了。
+    cfg = engine.BacktestConfig(initial_cash=10_000_000.0 * len(basket),
+                                max_positions=len(basket))
+    r = engine.run(BuyHold(), basket, START, END, cfg, names)
     assert "error" not in r.metrics, r.metrics.get("error")
 
-    raw = store.load_daily(codes=codes, start=START, end=END)
-    rets = [g.sort_values("date")["close"].iloc[-1] / g.sort_values("date")["close"].iloc[0] - 1
-            for _, g in raw.groupby("code") if len(g) > 200]
+    rets = [groups[c]["close"].iloc[-1] / groups[c]["close"].iloc[0] - 1 for c in basket]
     actual = float(np.mean(rets))
     got = r.metrics["total_return"]
-    # 差异只应来自手续费、次日开盘买入和买不满的仓位，超过 8 个百分点就说明成本模型有系统性错误
-    assert abs(got - actual) < 0.08, (
+    # 同一篮子、资金给足之后，差异只应来自手续费、次日开盘买入和开头停牌晚买的几只，
+    # 超过 4 个百分点就说明成本模型有系统性错误（原来篮子不同，只能放到 8 个点）
+    assert abs(got - actual) < 0.04, (
         f"买入持有 {got:+.2%} 与标的等权 {actual:+.2%} 相差过大，成本模型可能有误")
-    return f"回测 {got:+.2%} vs 实际等权 {actual:+.2%}"
+    return f"{len(basket)} 只：回测 {got:+.2%} vs 实际等权 {actual:+.2%}"
+
+
+@check("引擎：停牌期间持仓按停牌前收盘价计价（不能退回成本价）")
+def _t_suspend_value():
+    """原来停牌按成本价计：涨了 50% 的票一停牌，净值当天凭空回吐那 50%，
+    复牌再跳回来——回撤、波动率、夏普都被扭曲，不报错。"""
+    s = _sample(n=300)
+    if s is None:
+        return "跳过：本地数据不足"
+    codes, names = s
+    days = store.trading_days(start="2022-01-01", end="2024-12-31")
+    pos = {d: i for i, d in enumerate(days)}
+    raw = store.load_daily(codes=codes, start=days[0], end=days[-1])
+    pick = None
+    for code, g in raw.groupby("code"):
+        idx = [pos[d] for d in g["date"].dt.strftime("%Y-%m-%d") if d in pos]
+        gaps = [(a, b) for a, b in zip(idx, idx[1:]) if b - a > 1 and a >= 40]
+        if gaps:
+            pick = (code, gaps[0])
+            break
+    if pick is None:
+        return "跳过：样本里没有停牌的股票"
+    code, (a, b) = pick
+
+    class BuyHold(Strategy):
+        name, label, defaults = "_bh_susp", "买入持有", {}
+
+        def entry(self, df):
+            return safe(df["ma60"].notna())
+
+        def exit(self, df):
+            return safe(pd.Series(False, index=df.index))
+
+    r = engine.run(BuyHold(), [code], days[a - 30], days[b + 3],
+                   engine.BacktestConfig(initial_cash=100_000, max_positions=1), names)
+    eq = r.equity.set_index("date")["equity"]
+    held = r.equity.set_index("date")["positions"]
+    before = float(eq.loc[days[a]])
+    assert held.loc[days[a]] == 1, f"{code} 停牌前没有建仓，检查不成立"
+    for k in range(a + 1, b):
+        got = float(eq.loc[days[k]])
+        assert abs(got - before) < 0.01, (
+            f"{code} 停牌日 {days[k]} 净值 {got:,.2f}，停牌前 {before:,.2f}——"
+            "停牌期间价格没变，净值不该变")
+    return f"{code} 停牌 {b - a - 1} 天，净值保持在停牌前 {before:,.0f}"
 
 
 @check("引擎：涨跌停与停牌确实拦下了成交")
@@ -310,12 +404,21 @@ def _paper_vs_engine(strategy: str, params: dict, cfg: engine.BacktestConfig,
             pt = pd.read_sql("SELECT code,open_date,close_date,shares,pnl "
                              "FROM paper_trade WHERE account=?", c,
                              params=(SELFTEST_ACCOUNT,))
+            pe = pd.read_sql("SELECT date,equity FROM paper_equity WHERE account=?",
+                             c, params=(SELFTEST_ACCOUNT,))
     finally:
         uni_mod.build = orig
 
     et = pd.DataFrame([{"code": t.code, "open_date": t.open_date,
                         "close_date": t.close_date, "shares": t.shares,
                         "pnl": round(t.pnl, 2)} for t in r.trades])
+    # 成交一致还不够：持仓怎么估值（停牌按什么价）只体现在净值上
+    if not pe.empty and not r.equity.empty:
+        m = pe.merge(r.equity[["date", "equity"]], on="date", suffixes=("_p", "_e"))
+        diff = (m["equity_p"] - m["equity_e"]).abs()
+        assert len(m) and diff.max() < 0.05 * max(len(et), 1) + 0.05, (
+            f"{strategy} 每日净值不一致，最大差 {diff.max():.2f}"
+            f"（{m.loc[diff.idxmax(), 'date']}）")
     return et, pt
 
 

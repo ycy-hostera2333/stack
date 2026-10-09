@@ -50,6 +50,28 @@ def price_limit(code: str, name: str = "") -> float:
     return limit
 
 
+# 涨跌停判定的容差。交易所的涨跌停价是「前收 ×(1±幅度)」四舍五入到分：
+# 前收 10.13 的涨停价是 11.14，不是 11.143。早先用 1e-6 的容差去比，
+# 凡是向下取整的涨停（约一半）都判不出来，回测照样在一字板上「买到」，
+# 结果系统性偏乐观；行情源给的前复权价本身也只到分，两头各有半分的舍入。
+# 所以容差取一分钱；低价股不超过前收的 0.5%，免得把 +9% 的开盘也当成涨停。
+LIMIT_TICK = 0.01
+
+
+def _limit_tol(prev_close: float) -> float:
+    return min(LIMIT_TICK, 0.005 * prev_close)
+
+
+def hit_limit_up(px: float, prev_close: float, limit: float) -> bool:
+    """以 px 成交是否撞在涨停价上（开盘一字涨停视为买不进）。"""
+    return px >= prev_close * (1 + limit) - _limit_tol(prev_close)
+
+
+def hit_limit_down(px: float, prev_close: float, limit: float) -> bool:
+    """以 px 成交是否撞在跌停价上（开盘一字跌停视为卖不出）。"""
+    return px <= prev_close * (1 - limit) + _limit_tol(prev_close)
+
+
 def buy_cost(amount: float) -> float:
     """买入总费用（佣金 + 过户费）。"""
     return max(amount * COMMISSION_RATE, COMMISSION_MIN) + amount * TRANSFER_FEE_RATE

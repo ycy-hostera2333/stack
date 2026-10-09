@@ -20,12 +20,11 @@ from datetime import datetime
 
 import pandas as pd
 
-from .config import LOT_SIZE, buy_cost, price_limit, sell_cost
+from .config import (LOT_SIZE, buy_cost, hit_limit_down, hit_limit_up,
+                     price_limit, sell_cost)
 from .data import store, universe
 from .strategies import get_strategy
 from .strategies.base import blend_score_fields
-
-EPS = 1e-6
 
 DEFAULT_ACCOUNT = "default"
 _NAME_RE = re.compile(r"^[\w一-龥-]{1,32}$")
@@ -282,8 +281,7 @@ def advance(as_of: str | None = None, verbose: bool = True,
 
     score_fields = list(getattr(strat, "score_fields", None) or [])
     bars, sig = {}, {}
-    for code, g in raw.groupby("code", sort=False):
-        g = store.usable_history(g.sort_values("date"))
+    for code, g in store.iter_stocks(raw):
         if len(g) < 130:
             continue
         idx = g["date"].dt.strftime("%Y-%m-%d")
@@ -320,6 +318,23 @@ def advance(as_of: str | None = None, verbose: bool = True,
         v = float(b.loc[date, field])
         return v if v > 0 else None
 
+    def last_close(code, fallback):
+        """as_of 及之前最后一根 K 线的收盘价。停牌的持仓按它计价，与引擎的
+        _Position.last 一致；原来按成本价，停牌一天净值就回吐全部浮盈。"""
+        b = bars.get(code)
+        if b is None or b.empty:
+            return fallback
+        v = float(b["close"].iloc[-1])
+        return v if v > 0 else fallback
+
+    # 当日所有写库动作先攒着，最后一个事务一次写完。原来是边算边写、每步各开
+    # 一个连接：卖出已记成交、已删持仓，现金和 last_date 却在最后才更新——
+    # 中途任何一步抛异常，卖出所得就凭空消失，而重跑会被当成新的一天再卖一遍。
+    # 前向记录不可再生，宁可整天不落库，也不能落半天。
+    trade_rows: list[tuple] = []
+    sold: list[str] = []
+    bought: list[tuple] = []
+
     # 到期续持的名单：与下面买入环节同一套筛选和排序，只是把已持有的也算进去。
     # 与引擎 run() 里的 renew 逐字对应（自检「逐笔等价」盯着两边）。
     renew = None
@@ -349,7 +364,7 @@ def advance(as_of: str | None = None, verbose: bool = True,
             continue
         if not s["exit"] and not expired:
             continue
-        if o <= pc * (1 - price_limit(code, h["name"])) + EPS:
+        if hit_limit_down(o, pc, price_limit(code, h["name"])):
             events["blocked"].append(f"{code} {h['name']} 开盘跌停，卖不出")
             continue
         gross = o * h["shares"]
@@ -358,17 +373,11 @@ def advance(as_of: str | None = None, verbose: bool = True,
         pnl = proceeds - h["cost"] * h["shares"]
         reason = (f"持有满 {max_hold} 日到期" if expired and not s["exit"]
                   else strat.reason(s["row"], "SELL"))
-        with store.connect() as c:
-            c.execute("""INSERT INTO paper_trade (account,code,name,open_date,
-                close_date,shares,open_price,close_price,pnl,pnl_pct,hold_days,
-                open_reason,close_reason)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                      (account, code, h["name"], h["open_date"], as_of, h["shares"],
-                       round(h["cost"], 3), round(o, 3), round(pnl, 2),
-                       round(pnl / (h["cost"] * h["shares"]), 4), h["hold_days"],
-                       h["open_reason"], reason))
-            c.execute("DELETE FROM paper_holding WHERE account=? AND code=?",
-                      (account, code))
+        trade_rows.append((account, code, h["name"], h["open_date"], as_of,
+                           h["shares"], round(h["cost"], 3), round(o, 3),
+                           round(pnl, 2), round(pnl / (h["cost"] * h["shares"]), 4),
+                           h["hold_days"], h["open_reason"], reason))
+        sold.append(code)
         events["sells"].append({"code": code, "name": h["name"], "price": round(o, 2),
                                 "shares": h["shares"], "pnl": round(pnl, 2),
                                 "pnl_pct": round(pnl / (h["cost"] * h["shares"]), 4),
@@ -381,7 +390,10 @@ def advance(as_of: str | None = None, verbose: bool = True,
         cands = [(v["score"], c) for c, v in sig.items()
                  if v["entry"] and c not in holds]
         cands.sort(key=lambda x: -x[0] if x[0] == x[0] else 9e9)
-        mv = sum(h["shares"] * (px_at(c, as_of, "close") or h["cost"])
+        # 按今日开盘价估值（下单时只知道开盘价），停牌的按最后收盘价，
+        # 与引擎 run() 的 mv_now 逐字对应
+        mv = sum(h["shares"] * (px_at(c, as_of, "open")
+                                or last_close(c, h["cost"]))
                  for c, h in holds.items())
         budget = (cash + mv) / max_pos
         for _, code in cands:
@@ -391,7 +403,7 @@ def advance(as_of: str | None = None, verbose: bool = True,
             if o is None or pc is None:
                 continue
             name = names.get(code, code)
-            if o >= pc * (1 + price_limit(code, name)) - EPS:
+            if hit_limit_up(o, pc, price_limit(code, name)):
                 events["blocked"].append(f"{code} {name} 开盘涨停，买不进")
                 continue
             shares = int(budget / o // LOT_SIZE) * LOT_SIZE
@@ -405,11 +417,7 @@ def advance(as_of: str | None = None, verbose: bool = True,
             cash -= gross + fee
             cost = (gross + fee) / shares
             reason = strat.reason(sig[code]["row"], "BUY")
-            with store.connect() as c:
-                c.execute("""INSERT INTO paper_holding
-                    (account,code,name,shares,cost,open_date,open_reason,peak,hold_days)
-                    VALUES (?,?,?,?,?,?,?,?,0)""",
-                          (account, code, name, shares, cost, as_of, reason, cost))
+            bought.append((account, code, name, shares, cost, as_of, reason, cost))
             holds[code] = {"name": name, "shares": shares, "cost": cost,
                            "open_date": as_of, "open_reason": reason,
                            "peak": cost, "hold_days": 0}
@@ -422,14 +430,11 @@ def advance(as_of: str | None = None, verbose: bool = True,
     mv = 0.0
     updates = []
     for code, h in holds.items():
-        c_px = px_at(code, as_of, "close") or h["cost"]
-        h["peak"] = max(h["peak"], c_px)
-        mv += h["shares"] * c_px
+        c_px = px_at(code, as_of, "close")
+        if c_px is not None:
+            h["peak"] = max(h["peak"], c_px)
+        mv += h["shares"] * (c_px or last_close(code, h["cost"]))
         updates.append((h["peak"], h["hold_days"], account, code))
-    if updates:                      # 一次连接写完，而不是每只持仓开一次
-        with store.connect() as conn:
-            conn.executemany("UPDATE paper_holding SET peak=?, hold_days=? "
-                             "WHERE account=? AND code=?", updates)
     equity = cash + mv
 
     bench = None
@@ -437,14 +442,26 @@ def advance(as_of: str | None = None, verbose: bool = True,
     if not bd.empty:
         bench = float(bd.sort_values("date")["close"].iloc[-1])
 
-    with store.connect() as c:
+    with store.connect() as c:                  # 一个事务：要么整天落库，要么都不落
+        c.executemany("""INSERT INTO paper_trade (account,code,name,open_date,
+            close_date,shares,open_price,close_price,pnl,pnl_pct,hold_days,
+            open_reason,close_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                      trade_rows)
+        c.executemany("DELETE FROM paper_holding WHERE account=? AND code=?",
+                      [(account, code) for code in sold])
+        c.executemany("""INSERT INTO paper_holding
+            (account,code,name,shares,cost,open_date,open_reason,peak,hold_days)
+            VALUES (?,?,?,?,?,?,?,?,0)""", bought)
+        c.executemany("UPDATE paper_holding SET peak=?, hold_days=? "
+                      "WHERE account=? AND code=?", updates)
         c.execute("""INSERT OR REPLACE INTO paper_equity
                      (account,date,equity,cash,positions,bench,note)
                      VALUES (?,?,?,?,?,?,?)""",
                   (account, as_of, round(equity, 2), round(cash, 2), len(holds),
                    bench, "" if regime_on else "择时空仓"))
-    _set("cash", cash, account=account)
-    _set("last_date", as_of, account=account)
+        c.executemany("INSERT INTO paper_meta (account,key,value) VALUES (?,?,?) "
+                      "ON CONFLICT(account,key) DO UPDATE SET value=excluded.value",
+                      [(account, "cash", str(cash)), (account, "last_date", as_of)])
 
     events["equity"] = round(equity, 2)
     events["cash"] = round(cash, 2)
@@ -557,7 +574,11 @@ def status(account: str = DEFAULT_ACCOUNT) -> dict:
         e = eq["equity"].to_numpy()
         out["equity"] = float(e[-1])
         out["total_return"] = float(e[-1] / init_cash - 1) if init_cash else 0.0
-        out["max_drawdown"] = float((e / pd.Series(e).cummax().to_numpy() - 1).min())
+        # 峰值从初始资金算起，与回测的 metrics.compute 同口径
+        peak = pd.Series(e).cummax().to_numpy()
+        if init_cash:
+            peak = peak.clip(min=init_cash)
+        out["max_drawdown"] = float(min((e / peak - 1).min(), 0.0))
         b = eq["bench"].dropna()
         if len(b) > 1:
             out["benchmark_return"] = float(b.iloc[-1] / b.iloc[0] - 1)

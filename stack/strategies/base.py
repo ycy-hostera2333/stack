@@ -46,9 +46,15 @@ class Strategy:
     #   改了这个声明就去把那项跑一遍。
     indicators: tuple[str, ...] | None = None
 
+    # 已经下线的参数名：传进来时静默丢掉，不报错。参数会随模拟盘账户一起落库，
+    # 直接从 defaults 删掉的话，老账户下次推进就会因为「没有参数 xxx」而失败。
+    retired: tuple[str, ...] = ()
+
     def __init__(self, **params):
         merged = {**self.defaults}
         for k, v in params.items():
+            if k in self.retired and k not in self.defaults:
+                continue
             if k not in self.defaults:
                 raise ValueError(
                     f"策略 {self.name} 没有参数 {k!r}，可用：{sorted(self.defaults)}")
@@ -118,8 +124,13 @@ class Strategy:
     score_fields: list = field(default_factory=list)
 
     def score(self, df: pd.DataFrame) -> pd.Series:
-        """默认用 60 日动量排序，让强势股优先。"""
-        return df.get("mom60", pd.Series(0.0, index=df.index)).fillna(-9.9)
+        """默认用 60 日动量排序，让强势股优先。
+
+        indicators 里没声明 mom60 时现算一份。原来是 df.get("mom60", 0)：
+        精简了指标集的策略打分会静默全变成 0，「按打分取前 N」退化成按代码序取。
+        """
+        m = df["mom60"] if "mom60" in df.columns else ind.momentum(df["close"], 60)
+        return m.fillna(-9.9)
 
     def reason(self, row: pd.Series, action: str) -> str:
         """给出人类可读的信号理由，界面上直接展示。"""

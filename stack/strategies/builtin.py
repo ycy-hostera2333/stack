@@ -22,6 +22,8 @@ class MaTrend(Strategy):
         "跌破 MA20 时卖出。典型的趋势跟踪：牛市吃大段、震荡市反复止损，"
         "建议配合「跟踪止损 ×ATR」一起用（推荐 2.5）。"
     )
+    # 只算用得到的通用指标（见 Strategy.indicators）。atr14 留着给引擎的跟踪止损。
+    indicators = ("high20", "vol_ratio", "atr14", "mom60")   # mom60：基类默认打分
     defaults = {
         "vol_ratio_min": 1.2,   # 突破日量能需达到 20 日均量的倍数
         "ma_fast": 5, "ma_mid": 20, "ma_slow": 60,
@@ -34,6 +36,20 @@ class MaTrend(Strategy):
                    "hint": "同时也是离场均线：跌破它就卖"},
         "ma_slow": {"label": "慢线周期", "min": 10, "max": 250, "step": 10},
     }
+
+    def validate(self) -> None:
+        p = self.params
+        if not (0 < int(p["ma_fast"]) < int(p["ma_mid"]) < int(p["ma_slow"])):
+            raise ValueError(f"均线周期须满足 快线({p['ma_fast']}) < 中线({p['ma_mid']}) "
+                             f"< 慢线({p['ma_slow']})，否则「多头排列」永远不成立")
+
+    def warmup_bars(self) -> int:
+        return max(int(self.params["ma_slow"]) + 5, 60) + 30
+
+    def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
+        p = self.params
+        return ind.add_periods(super().prepare(df),
+                               ma=(p["ma_fast"], p["ma_mid"], p["ma_slow"]))
 
     def entry(self, df: pd.DataFrame) -> pd.Series:
         p = self.params
@@ -52,10 +68,11 @@ class MaTrend(Strategy):
         return cross_below(df["close"], df[f"ma{p['ma_mid']}"])
 
     def reason(self, row: pd.Series, action: str) -> str:
+        m = int(self.params["ma_mid"])
         if action == "BUY":
             return (f"多头排列突破20日高 {row['high20']:.2f}，"
-                    f"量比 {row['vol_ratio']:.1f}，MA20 {row['ma20']:.2f}")
-        return f"跌破 MA20 {row['ma20']:.2f}"
+                    f"量比 {row['vol_ratio']:.1f}，MA{m} {row[f'ma{m}']:.2f}")
+        return f"跌破 MA{m} {row[f'ma{m}']:.2f}"
 
 
 @register
@@ -68,6 +85,8 @@ class MaCross(Strategy):
         "长周期组合（如 20/60）信号少、跟得慢但抗震荡。"
         "建议先用它跑几组参数，看看哪段周期在你关心的时间区间上站得住。"
     )
+    # 只算用得到的通用指标（见 Strategy.indicators）。atr14 留着给引擎的跟踪止损。
+    indicators = ("atr14", "mom60")   # mom60：基类默认打分
     defaults = {
         "fast": 10,          # 快线周期
         "slow": 30,          # 慢线周期
@@ -147,6 +166,8 @@ class RsiReversal(Strategy):
         "只在长期趋势向上的股票里做（收盘价站上 MA120），等 RSI 跌进超卖区且当日收阳时买入，"
         "RSI 回到高位或跌破 MA60 时卖出。逆势低吸，胜率高但单笔盈亏比一般。"
     )
+    # 只算用得到的通用指标（见 Strategy.indicators）。atr14 留着给引擎的跟踪止损。
+    indicators = ("rsi14", "dd", "mom120", "atr14")
     defaults = {
         "rsi_buy": 32, "rsi_sell": 68,
         "trend_ma": 120, "stop_ma": 60,
@@ -162,6 +183,14 @@ class RsiReversal(Strategy):
         "max_dd": {"label": "最大回撤容忍", "min": -1, "max": 0, "step": 0.05,
                    "hint": "-0.3 表示距阶段高点已跌超 30% 的不接"},
     }
+
+    def warmup_bars(self) -> int:
+        p = self.params
+        return max(int(p["trend_ma"]), int(p["stop_ma"]), 120) + 30
+
+    def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
+        p = self.params
+        return ind.add_periods(super().prepare(df), ma=(p["trend_ma"], p["stop_ma"]))
 
     def entry(self, df: pd.DataFrame) -> pd.Series:
         p = self.params
@@ -183,10 +212,11 @@ class RsiReversal(Strategy):
         return (100 - df["rsi14"]).fillna(0) + df["mom120"].fillna(0) * 20
 
     def reason(self, row: pd.Series, action: str) -> str:
+        t, s = int(self.params["trend_ma"]), int(self.params["stop_ma"])
         if action == "BUY":
-            return (f"长期趋势向上（MA120 {row['ma120']:.2f}），"
+            return (f"长期趋势向上（MA{t} {row[f'ma{t}']:.2f}），"
                     f"RSI 回落至 {row['rsi14']:.0f} 且当日收阳")
-        return f"RSI 升至 {row['rsi14']:.0f} 或跌破 MA60 {row['ma60']:.2f}"
+        return f"RSI 升至 {row['rsi14']:.0f} 或跌破 MA{s} {row[f'ma{s}']:.2f}"
 
 
 @register
@@ -194,22 +224,33 @@ class MomentumRotation(Strategy):
     name = "momentum_rotation"
     label = "动量轮动"
     description = (
-        "横截面策略：每期在全市场按 60 日动量排名，买入排名靠前且站上 MA60 的股票，"
-        "掉出排名区间或跌破 MA60 就换掉。适合搭配较低的调仓频率（周频/月频）。"
+        "横截面策略：每期在全市场按「动量 ÷ 波动率」排名，买入排名最靠前且站上趋势均线的"
+        "几只（只数即「最多持仓」），动量转负或跌破均线就换掉。"
+        "适合搭配较低的调仓频率（周频/月频）。"
     )
+    # 只算用得到的通用指标（见 Strategy.indicators）。atr14 留着给引擎的跟踪止损。
+    indicators = ("vol20", "atr14")
     defaults = {
         "lookback": 60,
-        "keep_rank": 0.10,   # 进入前 10% 才买
-        "drop_rank": 0.30,   # 掉出前 30% 就卖
         "min_ma": 60,
     }
+    # 原先有「买入排名分位 / 卖出排名分位」两个参数，但 entry/exit 一行都没用到——
+    # 界面上调了不起任何作用。排名筛选实际由引擎按 score 取前「最多持仓」只完成。
+    retired = ("keep_rank", "drop_rank")
     param_meta = {
         "lookback": {"label": "动量回看(日)", "min": 10, "max": 250, "step": 10},
-        "keep_rank": {"label": "买入排名分位", "min": 0.01, "max": 1, "step": 0.05},
-        "drop_rank": {"label": "卖出排名分位", "min": 0.01, "max": 1, "step": 0.05},
         "min_ma": {"label": "趋势均线", "min": 10, "max": 250, "step": 10,
                    "hint": "站上才买、跌破就卖"},
     }
+
+    def warmup_bars(self) -> int:
+        p = self.params
+        return max(int(p["lookback"]) + 1, int(p["min_ma"]) + 10, 60) + 30
+
+    def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
+        p = self.params
+        return ind.add_periods(super().prepare(df), ma=(p["min_ma"],),
+                               mom=(p["lookback"],))
 
     def entry(self, df: pd.DataFrame) -> pd.Series:
         # 个股层面只做趋势过滤，真正的排名筛选交给引擎的 score + max_positions
@@ -231,10 +272,11 @@ class MomentumRotation(Strategy):
         return (mom / df["vol20"].replace(0, np.nan)).fillna(-9.9)
 
     def reason(self, row: pd.Series, action: str) -> str:
+        lb, n = int(self.params["lookback"]), int(self.params["min_ma"])
         if action == "BUY":
-            return (f"60日动量 {row['mom60']:+.1%}，年化波动 {row['vol20']:.1%}，"
-                    f"站上 MA60 {row['ma60']:.2f}")
-        return f"动量转负或跌破 MA60 {row['ma60']:.2f}"
+            return (f"{lb}日动量 {row[f'mom{lb}']:+.1%}，年化波动 {row['vol20']:.1%}，"
+                    f"站上 MA{n} {row[f'ma{n}']:.2f}")
+        return f"动量转负或跌破 MA{n} {row[f'ma{n}']:.2f}"
 
 
 @register
@@ -251,6 +293,8 @@ class RegimeMomentum(Strategy):
         "\n上限的依据是先验加「两段样本上回撤都下降」，不是收益——"
         "收益方向在样本内外相反，无法确认。详见 README 的样本外评估。"
     )
+    # 只算用得到的通用指标（见 Strategy.indicators）。atr14 留着给引擎的跟踪止损。
+    indicators = ("vol20", "atr14")
     defaults = {
         "index_ma": 200,      # 大盘择时均线（沪深300）
         "regime_confirm": 1,  # 择时状态翻转需连续确认的天数，1=不确认
@@ -310,26 +354,36 @@ class RegimeMomentum(Strategy):
         p = self.params
         c = df["close"]
         lb, sk = int(p["lookback"]), int(p["skip_recent"])
-        # 12-1 式动量：跳过最近 sk 日，只看更早那段的涨幅
-        df["mom_sk"] = c.shift(sk) / c.shift(sk + lb) - 1
-        df["ma_hold"] = ind.sma(c, int(p["hold_ma"]))
-        df["ma_exit"] = (df["ma_hold"] if not int(p["exit_ma"])
-                         else ind.sma(c, int(p["exit_ma"])))
-        return df
+        ma_hold = ind.sma(c, int(p["hold_ma"]))
+        # 三列一次拼上：逐列 df[col] = ... 每次都要重建块管理器，
+        # 模拟盘每天对几百只各做一遍，这一步曾占到单日推进的一成多
+        return pd.concat([df, pd.DataFrame({
+            # 12-1 式动量：跳过最近 sk 日，只看更早那段的涨幅
+            "mom_sk": c.shift(sk) / c.shift(sk + lb) - 1,
+            "ma_hold": ma_hold,
+            "ma_exit": (ma_hold if not int(p["exit_ma"])
+                        else ind.sma(c, int(p["exit_ma"]))),
+        }, index=df.index)], axis=1)
 
     def entry(self, df: pd.DataFrame) -> pd.Series:
         p = self.params
-        sig = ((df["close"] > df["ma_hold"])
-               & (df["ma_hold"] > df["ma_hold"].shift(20))
-               & (df["mom_sk"] > float(p["min_mom"])))
-        # 上限约束的依据是先验而非回测：动量效应在温和区间成立，
-        # 半年翻倍以上的多是泡沫尾端，均值回归风险远大于延续性。
-        # 实测未加上限时，买入标的的 120 日动量中位数高达 +103%，一半以上已翻倍。
-        if float(p["max_mom"]) > 0:
-            sig &= df["mom_sk"] <= float(p["max_mom"])
-        if float(p["max_vol"]) > 0:
-            sig &= df["vol20"] <= float(p["max_vol"])
-        return safe(sig)
+        # 比较全在 numpy 上做：语义与 pandas 逐列比较相同（NaN 比较恒为 False），
+        # 但少了十来次 Series 构造，全市场扫描时差别明显
+        close = df["close"].to_numpy(dtype="float64")
+        mh = df["ma_hold"].to_numpy(dtype="float64")
+        mh20 = np.full_like(mh, np.nan)
+        mh20[20:] = mh[:-20]
+        mom = df["mom_sk"].to_numpy(dtype="float64")
+        with np.errstate(invalid="ignore"):
+            sig = (close > mh) & (mh > mh20) & (mom > float(p["min_mom"]))
+            # 上限约束的依据是先验而非回测：动量效应在温和区间成立，
+            # 半年翻倍以上的多是泡沫尾端，均值回归风险远大于延续性。
+            # 实测未加上限时，买入标的的 120 日动量中位数高达 +103%，一半以上已翻倍。
+            if float(p["max_mom"]) > 0:
+                sig &= mom <= float(p["max_mom"])
+            if float(p["max_vol"]) > 0:
+                sig &= df["vol20"].to_numpy(dtype="float64") <= float(p["max_vol"])
+        return pd.Series(sig, index=df.index)
 
     def exit(self, df: pd.DataFrame) -> pd.Series:
         return safe(df["close"] < df["ma_exit"])
@@ -365,6 +419,8 @@ class Defensive(Strategy):
         "实测（2019-2026 逐年）：胜率从动量策略的 26% 提升到 48%、回撤从 -46% 降到 -28%，"
         "但跑赢基准的年份数仍是 4/8，与动量策略持平——风险改善可确认，收益优势不可确认。"
     )
+    # 只算用得到的通用指标（见 Strategy.indicators）。atr14 留着给引擎的跟踪止损。
+    indicators = ("vol20", "mom20", "ma60", "atr14")
     defaults = {
         "index_ma": 200,        # 大盘择时，0=关闭
         "max_vol": 0.60,        # 年化波动率上限
@@ -480,11 +536,13 @@ class GrowthValue(Strategy):
     indicators: tuple[str, ...] = ()
     # 每日信号据此检查库里的财报是不是应有的最新一期，过期时给出警告
     uses_fundamentals = True
+    # min_amount（「额外流动性下限」）从来没有被任何代码读过，界面上调了不起作用。
+    # 流动性门槛请用股票池设置。老账户里存着的这个参数照样能加载。
+    retired = ("min_amount",)
     defaults = {
         "index_ma": 0,            # 大盘择时，0=关闭（实测只降回撤不提收益）
         "w_growth": 1.0,          # 权重：营收增长
         "w_value": 1.0,           # 权重：账面市值比
-        "min_amount": 0.0,        # 额外流动性下限（元），0=沿用股票池设置
         "max_pb": 0.0,            # 市净率上限，0=不限。防止买到净资产为负的壳
         "require_profit": 0,      # 1=剔除最新一期净利润 <=0 的：营收增长没变成利润
         "min_rev_base": 0.0,      # 上年同期营收（年化，亿元）下限，0=不限。防低基数
@@ -532,22 +590,25 @@ class GrowthValue(Strategy):
             fields += [("revenue", "f_rev"), ("ytd_months", "f_months")]
         if int(p["q_growth"]):
             fields.append(("revenue_q_yoy", "f_rev_q_yoy"))
+        # 新列先攒进 dict、最后一次拼上（逐列赋值每次都要重建块管理器）
+        new: dict[str, pd.Series] = {}
         for field, col in fields:
             panel = fd.as_panel(field, dates, [code])
-            df[col] = panel[code].to_numpy() if code in panel.columns else np.nan
+            new[col] = pd.Series(panel[code].to_numpy() if code in panel.columns
+                                 else np.nan, index=df.index, dtype="float32")
         if float(p["min_rev_base"]) > 0:
             # 营收是年初至今累计值：先按该期覆盖月数年化（一季报 ×4、中报 ×2），
             # 再按同比倒推上年同期。同比 <= -100% 时基数无意义，置空后自然被 entry 剔除。
-            annual = df["f_rev"].astype("float64") * 12.0 / df["f_months"]
-            yoy = df["f_rev_yoy"].astype("float64").where(df["f_rev_yoy"] > -100)
-            df["f_rev_base"] = annual / (1.0 + yoy / 100.0)
+            annual = new["f_rev"].astype("float64") * 12.0 / new["f_months"]
+            yoy = new["f_rev_yoy"].astype("float64").where(new["f_rev_yoy"] > -100)
+            new["f_rev_base"] = annual / (1.0 + yoy / 100.0)
         # BP = 每股净资产 / 价格。用 BP 而不是 PB：PB 在净资产为负时会变成
         # "很小的负数"，排序上反而排到前面，是估值因子最常见的陷阱。
-        df["f_bp"] = df["f_bps"] / df["close"].replace(0, np.nan)
+        new["f_bp"] = new["f_bps"] / df["close"].replace(0, np.nan)
         if int(p["ind_bp"]):
             # 全市场同行业里的 BP 百分位，面板进程内只建一次，见 fundamental.bp_industry_pct
-            df["f_bp_ind"] = fd.bp_industry_pct(dates, code)
-        return df
+            new["f_bp_ind"] = pd.Series(fd.bp_industry_pct(dates, code), index=df.index)
+        return pd.concat([df, pd.DataFrame(new, index=df.index)], axis=1)
 
     def entry(self, df: pd.DataFrame) -> pd.Series:
         p = self.params
@@ -613,6 +674,8 @@ class TurtleBreakout(Strategy):
         "海龟法则的简化版：突破 N 日最高价买入，跌破 M 日最低价卖出。"
         "规则极简、参数少，不容易过拟合，适合当作衡量其他策略的基准线。"
     )
+    # 只算用得到的通用指标（见 Strategy.indicators）。atr14 留着给引擎的跟踪止损。
+    indicators = ("atr14", "mom60")   # mom60：基类默认打分
     defaults = {"entry_days": 20, "exit_days": 10}
     param_meta = {
         "entry_days": {"label": "入场通道(日)", "min": 5, "max": 250, "step": 5,

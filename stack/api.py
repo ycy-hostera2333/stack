@@ -53,6 +53,15 @@ async def _run(fn, *a, **kw):
     return await asyncio.get_running_loop().run_in_executor(None, partial(fn, *a, **kw))
 
 
+async def _build_universe(flt=None, as_of=None) -> pd.DataFrame:
+    """universe.build 在 as_of 之前历史不足时会抛 InsufficientHistory，
+    那句话专门写清了「起始日往后挪到哪」。不接住的话界面只收到一个 500。"""
+    try:
+        return await _run(universe.build, flt, as_of)
+    except universe.InsufficientHistory as e:
+        raise HTTPException(400, str(e))
+
+
 # ------------------------------------------------------------------ 请求模型
 class UniverseReq(BaseModel):
     exclude_st: bool = True
@@ -96,6 +105,7 @@ class BacktestReq(BaseModel):
     take_profit: float = 0.0
     trail_stop_atr: float = 0.0
     max_hold_days: int = 0
+    renew_ranked: bool = False       # 到期仍在前 N 名则续持，见 BacktestConfig
     top: int = 800
     params: dict = Field(default_factory=dict)
     universe: UniverseReq = Field(default_factory=UniverseReq)
@@ -134,6 +144,7 @@ class PaperAccountReq(BaseModel):
     max_positions: int = 5
     top: int = 400
     max_hold_days: int = 0
+    renew_ranked: bool = False
     since: str = ""          # 从该日回补，空则从今天开始记
 
 
@@ -222,7 +233,7 @@ async def strategy_delete(name: str, force: bool = False):
 
 @app.post("/api/universe")
 async def get_universe(req: UniverseReq):
-    uni = await _run(universe.build, req.to_filter())
+    uni = await _build_universe(req.to_filter())
     if uni.empty:
         return {"count": 0, "by_board": {}, "rows": []}
     show = uni.head(300)[["code", "name", "board", "industry",
@@ -309,7 +320,7 @@ async def backtest(req: BacktestReq):
 
     # 股票池按回测**起始日**的流动性和价格筛选，不能用 req.end：
     # 用结束日的数据选股等于拿未来信息决定当初买什么，是典型的前视偏差。
-    uni = await _run(universe.build, req.universe.to_filter(), req.start)
+    uni = await _build_universe(req.universe.to_filter(), req.start)
     if uni.empty:
         raise HTTPException(400, "股票池为空，请先同步行情或放宽过滤条件")
     if req.top:
@@ -319,11 +330,15 @@ async def backtest(req: BacktestReq):
         initial_cash=req.initial_cash, max_positions=req.max_positions,
         stop_loss=req.stop_loss, take_profit=req.take_profit,
         trail_stop_atr=req.trail_stop_atr, max_hold_days=req.max_hold_days,
+        renew_ranked=req.renew_ranked,
     )
-    res = await _run(engine.run, strat, uni["code"].tolist(), req.start, req.end,
-                     cfg, dict(zip(uni["code"], uni["name"])))
+    try:
+        res = await _run(engine.run, strat, uni["code"].tolist(), req.start,
+                         req.end, cfg, dict(zip(uni["code"], uni["name"])))
+    except ValueError as e:
+        # 引擎在开跑前挡下的非法组合（如策略不算 ATR 却开了跟踪止损）
+        raise HTTPException(400, str(e))
     payload = res.to_json()
-    payload["universe_size"] = int(len(uni))
     payload["universe_size"] = int(len(uni))
     if req.code.strip():
         # 把体检结论一并给界面：试跑用的是编辑器里那份代码，让人看到
@@ -332,7 +347,6 @@ async def backtest(req: BacktestReq):
                                  ("ok", "checks", "notes", "warmup_bars",
                                   "defaults", "param_meta", "error", "line",
                                   "label", "description", "name")}
-    return JSONResponse(_clean(payload))
     return JSONResponse(_clean(payload))
 
 
@@ -350,7 +364,10 @@ async def get_signals(req: SignalReq):
                            portfolio_value=req.portfolio_value,
                            max_positions=req.max_positions,
                            allow_partial_bar=req.allow_partial_bar)
-    res = await _run(sig.generate, strat, req.universe.to_filter(), cfg)
+    try:
+        res = await _run(sig.generate, strat, req.universe.to_filter(), cfg)
+    except universe.InsufficientHistory as e:
+        raise HTTPException(400, str(e))
     if req.save and "error" not in res:
         res["saved"] = await _run(sig.persist, res)
     return JSONResponse(_clean(res))
@@ -433,10 +450,25 @@ _sync_state: dict = {"running": False, "phase": "", "done": 0,
                      "circuit_breaker": 3}
 _sync_log: collections.deque = collections.deque(maxlen=2000)
 source_stats: dict = {"tencent": 0, "baostock": 0, "tushare": 0, "akshare": 0, "none": 0}
+# 「有没有同步在跑」的检查和置位必须在同一把锁里完成。原来 running 是在线程池
+# 里的 _do_sync 开头才置位：按钮连点两下、或者守护线程恰好同时决定同步，
+# 两边都看到 running=False，于是两轮同步并发——请求量翻倍、更快被限流，
+# 两边还互相覆盖同一份进度和日志。
+_sync_lock = threading.Lock()
+
+
+def _claim_sync() -> bool:
+    """抢到同步权返回 True（随后必须调用 _do_sync，它会在结束时释放）。"""
+    with _sync_lock:
+        if _sync_state["running"]:
+            return False
+        _sync_state["running"] = True
+        return True
 
 
 def _do_sync(full: bool, limit: int | None, only_missing: bool = False,
              circuit_breaker: int = 3, slow: bool = False) -> None:
+    """调用前必须先 _claim_sync() 成功。"""
     _sync_log.clear()
     for k in source_stats:
         source_stats[k] = 0
@@ -499,7 +531,7 @@ def _do_sync(full: bool, limit: int | None, only_missing: bool = False,
 @app.post("/api/sync")
 async def start_sync(full: bool = False, limit: int | None = None,
                      only_missing: bool = False, circuit_breaker: int = 3):
-    if _sync_state["running"]:
+    if not _claim_sync():
         return {"started": False, "message": "同步已在进行中"}
     asyncio.get_running_loop().run_in_executor(
         None, _do_sync, full, limit, only_missing, circuit_breaker)
@@ -552,6 +584,12 @@ _paper_daemon: dict = {
 }
 _next_sync_at = 0.0                # 单调时钟上的下次允许同步时间
 
+# 推进模拟盘（守护线程）和建账户回补（后台任务）必须互斥。回补是按日期升序
+# 一天天 advance 的，要几十秒到几分钟；这期间账户已经出现在 list_accounts() 里，
+# 守护线程一旦醒来就会对它 catch_up——新账户只推进最新一天，于是 last_date
+# 直接跳到今天，回补剩下的日子全被「已处理过」挡掉。不报错，前向记录中间缺一大段。
+_paper_lock = threading.Lock()
+
 
 def _paper_flag(key: str, default: bool = True) -> bool:
     v = store.get_meta(f"paper_daemon_{key}")
@@ -600,7 +638,7 @@ def _paper_tick() -> None:
                 _paper_daemon["next_sync_in"] = wait
                 _paper_daemon["phase"] = (f"行情落后 {stale} 天，"
                                           f"数据源仍不通，{wait} 分钟后再试")
-            elif _sync_state["running"]:
+            elif not _claim_sync():
                 _paper_daemon["phase"] = "手动同步进行中，本轮跳过同步"
             else:
                 if _next_sync_at:      # 探活把退避提前解除了，记一笔
@@ -636,13 +674,14 @@ def _paper_tick() -> None:
 
         _paper_daemon["phase"] = "推进模拟盘"
         adv = {}
-        for a in paper.list_accounts():
-            name = a["account"]
-            try:
-                adv[name] = paper.catch_up(verbose=False, account=name)
-            except Exception as e:
-                # 一个账户炸了不能拖垮其他账户，但也绝不能吞掉——记下来给界面看
-                adv[name] = f"失败：{type(e).__name__}: {e}"
+        with _paper_lock:
+            for a in paper.list_accounts():
+                name = a["account"]
+                try:
+                    adv[name] = paper.catch_up(verbose=False, account=name)
+                except Exception as e:
+                    # 一个账户炸了不能拖垮其他账户，但也绝不能吞掉——记下来给界面看
+                    adv[name] = f"失败：{type(e).__name__}: {e}"
         _paper_daemon["advanced"] = adv
         bad = [k for k, v in adv.items() if isinstance(v, str)]
         _paper_daemon["phase"] = (f"完成，{len(bad)} 个账户出错" if bad else "完成")
@@ -682,22 +721,23 @@ def _do_create_account(req: PaperAccountReq) -> None:
     from . import paper
 
     try:
-        _paper_daemon["creating"] = {"account": req.account, "phase": "建立账户",
-                                     "done": 0, "total": 0}
-        paper.reset(req.strategy, req.params, req.cash, req.max_positions,
-                    req.top, req.max_hold_days, account=req.account)
-        if req.since:
-            days = store.trading_days(start=req.since)
-            _paper_daemon["creating"].update(phase="回补", total=len(days))
-            done = 0
-            # 必须按日期升序逐日推进：advance 会把 last_date 前移，
-            # 一旦先处理了最新日期，之前的日期都会被「已处理过」的守卫挡掉
-            for d in days:
-                ev = paper.advance(as_of=d, verbose=False, account=req.account)
-                if ev.get("skipped"):
-                    continue
-                done += 1
-                _paper_daemon["creating"]["done"] = done
+        with _paper_lock:                    # 与守护线程的推进互斥，见 _paper_lock
+            _paper_daemon["creating"]["phase"] = "建立账户"
+            paper.reset(req.strategy, req.params, req.cash, req.max_positions,
+                        req.top, req.max_hold_days, account=req.account,
+                        renew_ranked=req.renew_ranked)
+            if req.since:
+                days = store.trading_days(start=req.since)
+                _paper_daemon["creating"].update(phase="回补", total=len(days))
+                done = 0
+                # 必须按日期升序逐日推进：advance 会把 last_date 前移，
+                # 一旦先处理了最新日期，之前的日期都会被「已处理过」的守卫挡掉
+                for d in days:
+                    ev = paper.advance(as_of=d, verbose=False, account=req.account)
+                    if ev.get("skipped"):
+                        continue
+                    done += 1
+                    _paper_daemon["creating"]["done"] = done
         _paper_daemon["creating"].update(phase="完成")
     except Exception as e:
         _paper_daemon["creating"] = {"account": req.account, "phase": "失败",
@@ -744,6 +784,10 @@ async def paper_create(req: PaperAccountReq):
     if (await _run(paper.status, req.account)).get("strategy"):
         raise HTTPException(409, f"账户 {req.account} 已存在。"
                                  "重置会清空它已积累的前向记录，请先删除再建。")
+    # 在请求线程里就占住「正在建立」：放到后台任务里再置位的话，
+    # 连点两下会在它置位之前通过上面的检查，建出两个回补任务
+    _paper_daemon["creating"] = {"account": req.account, "phase": "等待守护线程",
+                                 "done": 0, "total": 0}
     asyncio.get_running_loop().run_in_executor(None, _do_create_account, req)
     return {"started": True, "account": req.account}
 

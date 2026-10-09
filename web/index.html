@@ -58,6 +58,12 @@ input,select{background:var(--panel2);border:1px solid var(--line);color:var(--f
   padding:6px 9px;border-radius:5px;font-size:13px;min-width:110px}
 input[type=checkbox]{min-width:auto;width:15px;height:15px;accent-color:var(--accent)}
 label.cb{flex-direction:row;align-items:center;gap:6px;padding-bottom:7px}
+details.desc summary{cursor:pointer;list-style:none}
+details.desc summary::-webkit-details-marker{display:none}
+details.desc .more::after{content:" 展开全文 ▾";color:var(--accent);white-space:nowrap}
+details.desc[open] .more::after{content:"收起 ▴"}
+details.desc[open] .h{display:none}
+details.desc .full{white-space:pre-line}
 button.go{background:var(--accent);color:#fff;border:none;padding:7px 18px;
   border-radius:5px;cursor:pointer;font-size:13px;font-weight:600}
 button.go:disabled{opacity:.5;cursor:not-allowed}
@@ -213,6 +219,7 @@ pre.code-err{border-color:rgba(240,83,79,.35);background:rgba(240,83,79,.06);
       <label>止盈 %<input type="number" id="bt-tp" value="0" step="1" min="0"></label>
       <label>跟踪止损 ×ATR<input type="number" id="bt-trail" value="0" step="0.5" min="0"></label>
       <label>最长持有(日)<input type="number" id="bt-hold" value="0" min="0"></label>
+      <label class="cb" title="配合「最长持有」使用：到期时仍排在前 N 名的继续持有、重新计时，不卖了再原价买回。growth_value 这类排名很稳的策略，能省掉约四分之三的操作和一笔笔佣金印花税"><input type="checkbox" id="bt-renew">到期续持</label>
       <label>股票池上限<input type="number" id="bt-top" value="800" min="10" step="100"></label>
       <button class="go" id="bt-run">开始回测</button>
     </div>
@@ -320,6 +327,7 @@ pre.code-err{border-color:rgba(240,83,79,.35);background:rgba(240,83,79,.06);
         <label>股票池前 N<input type="number" id="pp-top" value="400" min="50" step="50"></label>
         <label title="0 为不限。growth_value 这类 exit() 恒为 false 的打分策略必须设，否则买满就永远不动">
           持有期上限<input type="number" id="pp-hold" value="0" min="0"></label>
+        <label class="cb" title="配合「最长持有」使用：到期时仍排在前 N 名的继续持有、重新计时，不卖了再原价买回。growth_value 这类排名很稳的策略，能省掉约四分之三的操作和一笔笔佣金印花税"><input type="checkbox" id="pp-renew">到期续持</label>
         <label title="留空则从今天开始记。回补的那段是回测、不是前向验证——它只是让曲线有个起点">
           回补起始<input type="date" id="pp-since"></label>
       </div>
@@ -580,11 +588,23 @@ function collectParams(prefix){
   return out;
 }
 
+/* 策略说明：有的策略把整段研究记录写在说明里（growth_value 有两千多字），
+   全文铺开会把表单下面整屏占满。默认只露第一行，点开看全文。 */
+function descHtml(d){
+  d = String(d || '');
+  const first = d.split('\n')[0];
+  if (first === d && d.length <= 160) return esc(d);
+  const head = first.length > 160 ? first.slice(0, 160) + '…' : first;
+  return `<details class="desc"><summary><span class="h">${esc(head)}</span>`
+    + `<span class="more"></span></summary>`
+    + `<div class="full">${esc(d)}</div></details>`;
+}
+
 function bindStrategy(prefix){
   const sel = $('#'+prefix+'-strategy');
   sel.onchange = () => {
     const s = STRATS.find(x=>x.name===sel.value);
-    $('#'+prefix+'-desc').innerHTML = s ? esc(s.description) : '';
+    $('#'+prefix+'-desc').innerHTML = s ? descHtml(s.description) : '';
     renderParams(prefix);
   };
   sel.onchange();
@@ -675,6 +695,7 @@ $('#bt-run').onclick = async () => {
       max_positions: +$('#bt-maxpos').value,
       stop_loss: +$('#bt-sl').value/100, take_profit: +$('#bt-tp').value/100,
       trail_stop_atr: +$('#bt-trail').value, max_hold_days: +$('#bt-hold').value,
+      renew_ranked: $('#bt-renew').checked,
       top: +$('#bt-top').value, params: collectParams('bt'),
       universe: universeReq(),
     });
@@ -1093,7 +1114,8 @@ async function loadPaperAccount(){
   $('#pp-acct-note').textContent = s.strategy
     ? `${s.strategy} · 建于 ${s.created_at||'—'} · 本金 ${num(s.initial_cash,0)}`
     + ` · ${s.max_positions} 仓 · 池前 ${s.top}`
-    + (s.max_hold_days ? ` · 持有上限 ${s.max_hold_days} 日` : '') : '';
+    + (s.max_hold_days ? ` · 持有上限 ${s.max_hold_days} 日` : '')
+    + (s.renew_ranked ? ' · 到期续持' : '') : '';
 
   if(!s.days){
     $('#pp-out').innerHTML = `<div class="card dim">这个账户还没有任何净值记录。
@@ -1188,7 +1210,7 @@ async function loadDecay(days){
       所有等长窗口的分布里排位。${verdict}<br>
       这不是「模拟盘对回测」的校验——那两者在同一区间上逐笔相等（自检有专门一项盯着），
       相减恒为零。这里问的是另一件事：策略是不是已经不灵了。</div></div>`;
-  }catch(e){ box.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+  }catch(e){ $('#pp-bar').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
 }
 
 $('#pp-acct').onchange = e => { PP.acct = e.target.value; renderPaperBar(); loadPaperAccount(); };
@@ -1212,6 +1234,7 @@ $('#pp-create').onclick = async () => {
       account:name, strategy:$('#pp-strategy').value, params:collectParams('pp'),
       cash:+$('#pp-cash').value, max_positions:+$('#pp-maxpos').value,
       top:+$('#pp-top').value, max_hold_days:+$('#pp-hold').value,
+      renew_ranked:$('#pp-renew').checked,
       since:$('#pp-since').value||''});
     $('#pp-new').style.display='none'; $('#pp-name').value='';
     PP.acct = name;

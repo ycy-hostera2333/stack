@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from . import indicators as ind
+from .config import LIMIT_TICK, price_limit
 from .data import store, universe
 
 REGISTRY: dict[str, "Factor"] = {}
@@ -56,10 +57,7 @@ def build_panel(codes: list[str] | None = None, start: str | None = None,
         return {}
 
     # 负价历史（前复权累计分红超过当年股价）必须先截断，否则污染所有因子
-    keep = []
-    for _, g in raw.groupby("code", sort=False):
-        keep.append(store.usable_history(g.sort_values("date")))
-    raw = pd.concat(keep, ignore_index=True)
+    raw = pd.concat([g for _, g in store.iter_stocks(raw)], ignore_index=True)
 
     P = {}
     for f in ("open", "high", "low", "close", "volume", "amount"):
@@ -79,10 +77,10 @@ def tradable_mask(P: dict) -> pd.DataFrame:
     """t+1 日能否真正买进。剔除停牌和开盘涨停——信号再好也买不到。"""
     o, c = P["open"], P["close"]
     nxt_open = o.shift(-1)
-    limit = pd.Series(
-        [0.20 if str(x)[:3] in ("300", "301", "688", "689") else 0.10
-         for x in o.columns], index=o.columns, dtype="float32")
-    up = nxt_open >= c * (1 + limit) - 1e-6
+    limit = pd.Series([price_limit(x) for x in o.columns], index=o.columns,
+                      dtype="float64")
+    # 容差口径与引擎一致，见 config.LIMIT_TICK：涨停价是四舍五入到分的
+    up = nxt_open >= c * (1 + limit) - np.minimum(LIMIT_TICK, 0.005 * c)
     return nxt_open.notna() & c.notna() & ~up
 
 

@@ -554,14 +554,19 @@ def _fetch_tushare(code: str, start: str, end: str, adjust: str = "qfq") -> pd.D
             if df is None or df.empty:
                 return pd.DataFrame()
             # 截取到 end 日期
-            df = df[df["date"] <= end_iso]
+            df = df[df["date"] <= end_iso].copy()
             if df.empty:
                 return pd.DataFrame()
             df["code"] = code
-            for c in ("open", "high", "low", "close", "volume", "amount"):
+            for c in ("open", "high", "low", "close", "volume", "amount", "pct_chg"):
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors="coerce")
-            df["pct_chg"] = pd.NA
+            # fetch_daily_qfq 已经给了 pct_chg（交易所口径）。这里曾经整列覆盖成空：
+            # Tushare 主要用来补退市股，于是退市股的涨跌幅全是 NULL，
+            # 用到 pct_chg 的策略（defensive 的近 20 日最大单日涨幅）永远不会选中它们
+            # ——幸存者偏差从后门又回来了。只在源没给的时候才由收盘价推算。
+            if "pct_chg" not in df.columns or df["pct_chg"].isna().all():
+                df["pct_chg"] = df["close"].pct_change() * 100
             df["turnover"] = pd.NA
             return df.dropna(subset=["close"])
         except Exception:
@@ -588,77 +593,45 @@ def fetch_daily(code: str, start: str = HISTORY_START, end: str | None = None,
     end = end or datetime.now().strftime("%Y%m%d")
     start_compact = pd.to_datetime(start).strftime("%Y%m%d")
     end_compact = pd.to_datetime(end).strftime("%Y%m%d")
+    from .tushare_source import available as _tushare_available
+
+    # 按优先级逐个试。后一个元素是「这个源能不能用」：不能用的直接跳过，
+    # 既不发请求、也不计入熔断，失败原因里写清为什么没用它。
+    chain = (
+        ("tencent", None, lambda: _fetch_tencent(code, start, end, adjust)),
+        # BaoStock **默认不启用**，见 USE_BAOSTOCK 的说明
+        ("baostock", None if USE_BAOSTOCK else "未启用",
+         lambda: _fetch_baostock(code, start, end, adjust)),
+        # Tushare 需要 token，退市股专用也能兜底
+        ("tushare", None if _tushare_available() else "未配置 token",
+         lambda: _fetch_tushare(code, start, end, adjust)),
+        # akshare（东财）最全字段但最慢、最易限流，放最后兜底
+        ("akshare", None,
+         lambda: _fetch_akshare(code, start_compact, end_compact, adjust)),
+    )
     # 每个源的结局，全部失败时拼成一条原因写进 sync_errors
-    why = {"tencent": "熔断跳过", "baostock": "未启用" if not USE_BAOSTOCK else "熔断跳过",
-           "tushare": "熔断跳过", "akshare": "熔断跳过"}
-
-    # 1) 腾讯（最快，绕开东财 CDN）
-    if not _circuit_open("tencent"):
-        df = _fetch_tencent(code, start, end, adjust)
-        why["tencent"] = _why(df)
+    why = {}
+    for src, disabled, fetch in chain:
+        if disabled:
+            why[src] = disabled
+            continue
+        if _circuit_open(src):
+            why[src] = "熔断跳过"
+            continue
+        df = fetch()
+        why[src] = _why(df)
         if not df.empty:
-            _circuit_reset("tencent")
+            _circuit_reset(src)
             if on_event:
-                on_event("tencent", len(df))
+                on_event(src, len(df))
             return df
         # 空表分两种：源正常应答但这只股票没数据（退市/长期停牌/次新），
         # 和源真的挂了。只有后者该记熔断——否则几只僵尸股就能把源判死，
         # 之后几千只健康股票全被跳过，而且一条错都不报。
         if _source_ok(df):
-            _circuit_reset("tencent")
+            _circuit_reset(src)
         else:
-            _circuit_fail("tencent")
-
-    # 2) BaoStock —— **默认不启用**，见 USE_BAOSTOCK 的说明
-    if USE_BAOSTOCK and not _circuit_open("baostock"):
-        df = _fetch_baostock(code, start, end, adjust)
-        why["baostock"] = _why(df)
-        if not df.empty:
-            _circuit_reset("baostock")
-            if on_event:
-                on_event("baostock", len(df))
-            return df
-        # 空表分两种：源正常应答但这只股票没数据（退市/长期停牌/次新），
-        # 和源真的挂了。只有后者该记熔断——否则几只僵尸股就能把源判死，
-        # 之后几千只健康股票全被跳过，而且一条错都不报。
-        if _source_ok(df):
-            _circuit_reset("baostock")
-        else:
-            _circuit_fail("baostock")
-
-    # 3) Tushare Pro（需要 token，退市股专用也能兜底）
-    if not _circuit_open("tushare"):
-        df = _fetch_tushare(code, start, end, adjust)
-        why["tushare"] = _why(df)
-        if not df.empty:
-            _circuit_reset("tushare")
-            if on_event:
-                on_event("tushare", len(df))
-            return df
-        # 空表分两种：源正常应答但这只股票没数据（退市/长期停牌/次新），
-        # 和源真的挂了。只有后者该记熔断——否则几只僵尸股就能把源判死，
-        # 之后几千只健康股票全被跳过，而且一条错都不报。
-        if _source_ok(df):
-            _circuit_reset("tushare")
-        else:
-            _circuit_fail("tushare")
-
-    # 4) akshare（东财，最全字段但慢）
-    if not _circuit_open("akshare"):
-        df = _fetch_akshare(code, start_compact, end_compact, adjust)
-        why["akshare"] = _why(df)
-        if not df.empty:
-            _circuit_reset("akshare")
-            if on_event:
-                on_event("akshare", len(df))
-            return df
-        # 空表分两种：源正常应答但这只股票没数据（退市/长期停牌/次新），
-        # 和源真的挂了。只有后者该记熔断——否则几只僵尸股就能把源判死，
-        # 之后几千只健康股票全被跳过，而且一条错都不报。
-        if _source_ok(df):
-            _circuit_reset("akshare")
-        else:
-            _circuit_fail("akshare")
+            _circuit_fail(src)
 
     # 全部失败：记录原因
     if on_event:
