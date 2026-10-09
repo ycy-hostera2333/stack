@@ -435,7 +435,8 @@ def run(strategy: Strategy, codes: list[str], start: str, end: str,
                 # 买入侧已有同样的守卫，卖出侧不能漏——负价格会算出负的卖出所得。
                 skipped["停牌"] += 1
                 continue
-            if hit_limit_down(px, prev_close, limits[i], float(P.low[i, j])):
+            if hit_limit_down(px, prev_close, limits[i],
+                              float(P.high[i, j]), float(P.low[i, j])):
                 skipped["跌停无法卖出"] += 1
                 continue
 
@@ -483,7 +484,7 @@ def run(strategy: Strategy, codes: list[str], start: str, end: str,
                     if px <= 0:
                         continue
                     if hit_limit_up(px, prev_close, limits[i],   # 一字涨停买不到
-                                    float(P.high[i, j])):
+                                    float(P.high[i, j]), float(P.low[i, j])):
                         skipped["涨停无法买入"] += 1
                         continue
 

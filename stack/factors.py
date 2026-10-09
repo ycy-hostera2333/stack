@@ -60,7 +60,11 @@ def build_panel(codes: list[str] | None = None, start: str | None = None,
     raw = pd.concat([g for _, g in store.iter_stocks(raw)], ignore_index=True)
 
     P = {}
-    for f in ("open", "high", "low", "close", "volume", "amount"):
+    # 价格列留 float64：可交易判定要按交易所规则把涨跌停价舍入到分，float32 在
+    # 一千元以上、或复权价不在整分上时会差出一分，和引擎/模拟盘的判定对不上
+    for f in ("open", "high", "low", "close"):
+        P[f] = raw.pivot(index="date", columns="code", values=f).astype("float64")
+    for f in ("volume", "amount"):
         P[f] = raw.pivot(index="date", columns="code", values=f).astype("float32")
     P["pct_chg"] = raw.pivot(index="date", columns="code",
                              values="pct_chg").astype("float32")
@@ -75,19 +79,17 @@ def forward_return(P: dict, horizon: int) -> pd.DataFrame:
 
 def tradable_mask(P: dict) -> pd.DataFrame:
     """t+1 日能否真正买进。剔除停牌和开盘涨停——信号再好也买不到。"""
-    # 面板是 float32，舍入到分之前先转回 float64 并抹掉 float32 的尾差：
-    # 1.05 存成 float32 是 1.0499999…，涨停价会被算成 1.15 而不是 1.16
-    o = P["open"].astype("float64").round(4)
-    c = P["close"].astype("float64").round(4)
+    o, c = P["open"].astype("float64"), P["close"].astype("float64")
     nxt_open = o.shift(-1)
-    nxt_high = P["high"].astype("float64").round(4).shift(-1)
+    nxt_high = P["high"].astype("float64").shift(-1)
+    nxt_low = P["low"].astype("float64").shift(-1)
     limit = pd.Series([price_limit(x) for x in o.columns], index=o.columns,
                       dtype="float64")
-    # 两道判据与引擎相同，见 config.hit_limit_up：精确涨停价，或「开盘即最高」且贴近涨停
+    # 两道判据与引擎相同，见 config.hit_limit_up：精确涨停价，或一字板（开=高=低）且贴近涨停
     m_exact = np.minimum(LIMIT_MARGIN[0], LIMIT_MARGIN[1] * c)
-    m_adj = np.minimum(LIMIT_ADJ_TOL[0], LIMIT_ADJ_TOL[1] * c)
+    one_price = (nxt_open >= nxt_high - 1e-9) & (nxt_open <= nxt_low + 1e-9)
     up = ((nxt_open >= limit_price(c, limit, True) - m_exact)
-          | ((nxt_open >= nxt_high - 1e-9) & (nxt_open >= c * (1 + limit) - m_adj)))
+          | (one_price & (nxt_open >= c * (1 + limit) - LIMIT_ADJ_TOL)))
     return nxt_open.notna() & c.notna() & ~up
 
 

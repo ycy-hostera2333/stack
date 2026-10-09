@@ -256,9 +256,11 @@ _KEEP_IF_NULL = ("amount", "turnover")
 # 就被写成空。这里新值为空时，用库里**前一根**的收盘价现算——不是简单保留旧值：
 # 那一行可能是盘中写进去的残缺 K 线，旧的涨跌幅是按盘中价算的，收盘价已经变了。
 # （同一批里新插入的行用不到这条：只有和库里已有行冲突时才走 DO UPDATE。）
+# 只看紧挨着的前一根：它的收盘价非正（前复权负价）或为空时留空，与 repair_pct_chg、
+# pandas 的 pct_change 同一口径，不跳过它去和更早的一根比。
 _PCT_FROM_PREV = ("COALESCE(excluded.pct_chg, ("
-                  "SELECT (excluded.close / p.close - 1) * 100 FROM daily AS p "
-                  "WHERE p.code = excluded.code AND p.date < excluded.date AND p.close > 0 "
+                  "SELECT CASE WHEN p.close > 0 THEN (excluded.close / p.close - 1) * 100 END "
+                  "FROM daily AS p WHERE p.code = excluded.code AND p.date < excluded.date "
                   "ORDER BY p.date DESC LIMIT 1))")
 
 

@@ -59,18 +59,21 @@ def price_limit(code: str, name: str = "") -> float:
 # 两道判据，任一成立即视为撞板：
 #   1. 精确价：按交易所规则算出涨跌停价，留半分钱余量（只为吸收浮点误差）。
 #      原始价上真正的涨跌停一个不漏，差一分的正常开盘一个不挡。
-#   2. 开盘即最高（跌停：开盘即最低）且离未取整的涨停价不到 LIMIT_ADJ_TOL。
-#      这一道是给**前复权的历史价**的：那是「原始价 × 复权因子」再取到分，
-#      按复权后的前收再算一遍涨停价、再取一次整，两次舍入能差出近两分钱，
-#      第 1 道会漏掉约六分之一的真涨停（送转股多的票尤其明显）。真涨停时当天不可能
-#      高过开盘价，这个独立信号让放宽的容差不至于误伤正常开盘。
-#      代价：原始价上「开盘差一分到涨停、且全天没高过开盘」也会被当成涨停——
-#      极少见，而且是保守方向（少买），不会让回测偏乐观。
-# 2026-10 在原始价、两位/三位小数前复权、未取整前复权、现金分红前复权五种模型上
-# 各 40 万例模拟：真涨停漏判 ≤ 0.01%，原始价上差一分且盘中更高的开盘误挡 0%。
-# (元, 占前收比例的上限)：低价股按比例缩小，免得把 +9% 的开盘也当成涨停
-LIMIT_MARGIN = (0.005, 0.005)
-LIMIT_ADJ_TOL = (0.016, 0.008)
+#   2. 一字板：开 = 高 = 低，且离未取整的涨跌停价不到 LIMIT_ADJ_TOL。
+#      这一道是给**前复权的历史价**的：那是「原始价 × 复权因子」再取到分，按复权后的
+#      前收重算涨停价又取一次整，两次舍入能差出一分半，第 1 道会漏掉约六分之一的
+#      真涨停（送转多、复权因子小的票尤其明显）。
+#
+#      门槛必须是「开 = 高 = 低」，不能只看「开 = 高」：开 = 高 意味着全天没高过开盘，
+#      收盘 <= 开盘——拿它当判据，挡掉的全是当天下跌的买入（卖出一侧同理，挡掉的全是
+#      当天反弹的卖出），等于用当天的结果筛交易，回测反而偏乐观。开 = 高 = 低 时收盘
+#      必然等于开盘，当天涨跌恒为零，这个判据不携带任何关于结果的信息。
+#      代价：前复权历史上「开在涨停、盘中又打开」的那种涨停，仍按第 1 道判，约六分之一
+#      判不出来——不知道复权因子就分不清，而用当天高低价去补又会引入上面的前视。
+# 2026-10 在原始价、两位/三位小数前复权、未取整前复权上各 40 万例模拟：一字板漏判 0，
+# 原始价上差一分、两分的正常开盘误挡 0。
+LIMIT_MARGIN = (0.005, 0.005)      # (元, 占前收比例的上限)
+LIMIT_ADJ_TOL = 0.02               # 元。一字板本身不带方向信息，不必按价格缩小
 
 
 def limit_price(prev_close, limit, up: bool = True):
@@ -84,27 +87,35 @@ def limit_price(prev_close, limit, up: bool = True):
     return np.floor(raw * 100 + 0.5 + 1e-6) / 100
 
 
-def _margin(prev_close, tol):
-    yuan, pct = tol
-    return np.minimum(yuan, pct * prev_close)
+def _exact_margin(prev_close):
+    return np.minimum(LIMIT_MARGIN[0], LIMIT_MARGIN[1] * prev_close)
+
+
+def _one_price(px, high, low) -> bool:
+    """开 = 高 = 低：全天一个价。"""
+    return (high is not None and low is not None
+            and px >= high - 1e-9 and px <= low + 1e-9)
 
 
 def hit_limit_up(px: float, prev_close: float, limit: float,
-                 high: float | None = None) -> bool:
-    """以 px 开盘成交是否撞在涨停价上（视为买不进）。high 是当天最高价，给了才启用第 2 道判据。"""
-    if px >= limit_price(prev_close, limit, True) - _margin(prev_close, LIMIT_MARGIN):
+                 high: float | None = None, low: float | None = None) -> bool:
+    """以 px 开盘成交是否撞在涨停价上（视为买不进）。
+
+    high/low 是当天最高/最低价，两个都给了才启用第 2 道判据（一字板）。
+    """
+    if px >= limit_price(prev_close, limit, True) - _exact_margin(prev_close):
         return True
-    return bool(high is not None and px >= high - 1e-9
-                and px >= prev_close * (1 + limit) - _margin(prev_close, LIMIT_ADJ_TOL))
+    return bool(_one_price(px, high, low)
+                and px >= prev_close * (1 + limit) - LIMIT_ADJ_TOL)
 
 
 def hit_limit_down(px: float, prev_close: float, limit: float,
-                   low: float | None = None) -> bool:
-    """以 px 开盘成交是否撞在跌停价上（视为卖不出）。low 是当天最低价，给了才启用第 2 道判据。"""
-    if px <= limit_price(prev_close, limit, False) + _margin(prev_close, LIMIT_MARGIN):
+                   high: float | None = None, low: float | None = None) -> bool:
+    """以 px 开盘成交是否撞在跌停价上（视为卖不出）。参数同 hit_limit_up。"""
+    if px <= limit_price(prev_close, limit, False) + _exact_margin(prev_close):
         return True
-    return bool(low is not None and px <= low + 1e-9
-                and px <= prev_close * (1 - limit) + _margin(prev_close, LIMIT_ADJ_TOL))
+    return bool(_one_price(px, high, low)
+                and px <= prev_close * (1 - limit) + LIMIT_ADJ_TOL)
 
 
 def buy_cost(amount: float) -> float:
