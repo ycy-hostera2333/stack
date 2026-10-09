@@ -184,6 +184,11 @@ def compile_code(code: str, name: str) -> type[Strategy]:
         cls.param_meta = {}
     elif not isinstance(cls.param_meta, dict):
         raise CodeError("param_meta 必须是 dict（给界面用的参数说明）；没有就删掉这一行")
+    # 内置策略各自声明了只算哪几列指标（为了快）。用户代码继承某个内置策略、
+    # 自己又没写 indicators 时，不能把这份精简声明一起继承下来：子类多用一列
+    # 就 KeyError，被引擎/信号/模拟盘吞掉，表现为「从此不出信号」。全算只是慢一点。
+    if "indicators" not in vars(cls):
+        cls.indicators = None
     return cls
 
 
@@ -521,6 +526,9 @@ def _load_row(name: str) -> dict | None:
 _loaded = False
 # 名字 → 加载失败原因。界面上必须能看到：否则表现只是「策略列表里少了一个」。
 load_errors: dict[str, str] = {}
+# 编译通过、已经注册，但在合成行情上试跑出错的（见 ensure_loaded）。与 load_errors
+# 分开：那个是「没加载」，这个是「加载了但多半跑不出信号」。
+load_warnings: dict[str, str] = {}
 
 
 def ensure_loaded(force: bool = False) -> None:
@@ -541,6 +549,18 @@ def ensure_loaded(force: bool = False) -> None:
             if row.get("description"):
                 cls.description = row["description"]
             load_errors.pop(name, None)
+            load_warnings.pop(name, None)
+            # 保存时体检过，但升级之后可能坏掉（内置策略、指标库改了接口）。
+            # 这里在合成行情上试跑一遍，坏了就在界面上说出来——否则引擎会把异常
+            # 吞成「不出信号」，模拟盘的前向记录照写不误。照样注册，不因此断掉账户。
+            try:
+                _run_signals(cls(), sample_df())
+            except _DataMissing:
+                pass
+            except CodeError as e:
+                load_warnings[name] = e.message
+            except Exception as e:
+                load_warnings[name] = f"{type(e).__name__}: {e}"
         except CodeError as e:
             load_errors[name] = e.message
         except Exception as e:

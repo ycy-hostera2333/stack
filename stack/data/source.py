@@ -562,9 +562,8 @@ def _fetch_tushare(code: str, start: str, end: str, adjust: str = "qfq") -> pd.D
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors="coerce")
             # fetch_daily_qfq 已经给了 pct_chg（交易所口径）。这里曾经整列覆盖成空：
-            # Tushare 主要用来补退市股，于是退市股的涨跌幅全是 NULL，
-            # 用到 pct_chg 的策略（defensive 的近 20 日最大单日涨幅）永远不会选中它们
-            # ——幸存者偏差从后门又回来了。只在源没给的时候才由收盘价推算。
+            # 腾讯失败、由 Tushare 兜底的那些在市股票，整段涨跌幅都是 NULL。
+            # 只在源没给的时候才由收盘价推算。
             if "pct_chg" not in df.columns or df["pct_chg"].isna().all():
                 df["pct_chg"] = df["close"].pct_change() * 100
             df["turnover"] = pd.NA
@@ -1000,6 +999,15 @@ def _sync_daily_impl(codes: list[str] | None = None, full: bool = False,
     stats["failed"] = len(remaining)
     stats["failed_codes"] = [c for c, _ in remaining]
     store.set_meta("daily_synced_at", datetime.now().isoformat(timespec="seconds"))
+    # 老库里由增量同步留下的 pct_chg 空洞补一次（upsert 现在不会再产生新的，
+    # 见 store._KEEP_IF_NULL）。逐只各一个事务，不会长时间占写锁；只做一次。
+    if not store.get_meta("pct_chg_repaired"):
+        try:
+            stats["pct_chg_repaired"] = store.repair_pct_chg()
+            store.set_meta("pct_chg_repaired",
+                           datetime.now().isoformat(timespec="seconds"))
+        except Exception as e:                # 补不上不影响同步本身，下次再试
+            stats["pct_chg_repair_error"] = f"{type(e).__name__}: {e}"
     return stats
 
 

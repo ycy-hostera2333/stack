@@ -282,11 +282,14 @@ def advance(as_of: str | None = None, verbose: bool = True,
     score_fields = list(getattr(strat, "score_fields", None) or [])
     bars, sig = {}, {}
     for code, g in store.iter_stocks(raw):
-        if len(g) < 130:
+        if len(g) < 130 and code not in holds:
             continue
         idx = g["date"].dt.strftime("%Y-%m-%d")
+        # 持仓的 K 线不管多短都要留着：计价（停牌按最后收盘价）只需要价格，
+        # 130 根的门槛是给算信号用的。原来一律跳过，停牌一年多（或退市）的持仓
+        # 掉出窗口后就退回按成本价计，和引擎的 _Position.last 对不上。
         bars[code] = g.set_index(idx)
-        if prev not in bars[code].index:
+        if len(g) < 130 or prev not in bars[code].index:
             continue
         try:
             d = strat.prepare(g)
@@ -322,10 +325,15 @@ def advance(as_of: str | None = None, verbose: bool = True,
         """as_of 及之前最后一根 K 线的收盘价。停牌的持仓按它计价，与引擎的
         _Position.last 一致；原来按成本价，停牌一天净值就回吐全部浮盈。"""
         b = bars.get(code)
-        if b is None or b.empty:
-            return fallback
-        v = float(b["close"].iloc[-1])
-        return v if v > 0 else fallback
+        if b is not None and not b.empty:
+            v = float(b["close"].iloc[-1])
+            if v > 0:
+                return v
+        # 窗口里一根都没有（停牌超过窗口长度、或已退市）：去库里找它最后一根
+        with store.connect() as c:
+            r = c.execute("SELECT close FROM daily WHERE code=? AND date<=? AND close>0 "
+                          "ORDER BY date DESC LIMIT 1", (code, as_of)).fetchone()
+        return float(r[0]) if r else fallback
 
     # 当日所有写库动作先攒着，最后一个事务一次写完。原来是边算边写、每步各开
     # 一个连接：卖出已记成交、已删持仓，现金和 last_date 却在最后才更新——
@@ -580,13 +588,18 @@ def status(account: str = DEFAULT_ACCOUNT) -> dict:
             peak = peak.clip(min=init_cash)
         out["max_drawdown"] = float(min((e / peak - 1).min(), 0.0))
         b = eq["bench"].dropna()
-        if len(b) > 1:
-            out["benchmark_return"] = float(b.iloc[-1] / b.iloc[0] - 1)
+        # 基准的基期取首个推进日的**前一交易日**收盘，与净值同一起点（初始资金在
+        # 首日开盘成交之前），也与回测引擎（dates[0] 收盘为基期）一致。原来取首个
+        # 推进日的收盘，漏掉第一天的指数涨跌，超额收益一直差着这一天。
+        base = _bench_base(str(eq["date"].iloc[0]))
+        if base is None and len(b):
+            base = float(b.iloc[0])          # 库里找不到前一天的指数：退回旧口径
+        if base and len(b):
+            out["benchmark_return"] = float(b.iloc[-1] / base - 1)
         out["idle_days"] = int((eq["note"] == "择时空仓").sum())
         # 指数点位（4000 上下）和账户净值（20 万）差两个数量级，同图画的话
         # 净值会被压成一条平线。归一到同一起点再传，前端直接画就是对的。
         bv = eq["bench"].astype(float).ffill()
-        base = float(bv.dropna().iloc[0]) if bv.notna().any() else 0.0
         out["curve"] = {
             "dates": eq["date"].tolist(),
             "equity": [round(float(x), 2) for x in eq["equity"]],
@@ -598,6 +611,17 @@ def status(account: str = DEFAULT_ACCOUNT) -> dict:
         out["win_rate"] = float((tr["pnl"] > 0).mean())
         out["realized_pnl"] = float(tr["pnl"].sum())
     return out
+
+
+def _bench_base(first: str) -> float | None:
+    """first（模拟盘首个推进日）之前最后一个交易日的沪深300收盘，作为基准的基期。"""
+    prior = [d for d in store.trading_days(end=first) if d < first]
+    if not prior:
+        return None
+    with store.connect() as c:
+        r = c.execute("SELECT close FROM daily WHERE code='IDX000300' AND date<=? "
+                      "AND close>0 ORDER BY date DESC LIMIT 1", (prior[-1],)).fetchone()
+    return float(r[0]) if r else None
 
 
 def decay_report(account: str = DEFAULT_ACCOUNT, min_days: int = 20,

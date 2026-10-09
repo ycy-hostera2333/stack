@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from . import indicators as ind
-from .config import LIMIT_TICK, price_limit
+from .config import limit_margin, limit_price, price_limit
 from .data import store, universe
 
 REGISTRY: dict[str, "Factor"] = {}
@@ -79,8 +79,8 @@ def tradable_mask(P: dict) -> pd.DataFrame:
     nxt_open = o.shift(-1)
     limit = pd.Series([price_limit(x) for x in o.columns], index=o.columns,
                       dtype="float64")
-    # 容差口径与引擎一致，见 config.LIMIT_TICK：涨停价是四舍五入到分的
-    up = nxt_open >= c * (1 + limit) - np.minimum(LIMIT_TICK, 0.005 * c)
+    # 口径与引擎一致，见 config.limit_price：涨停价按交易所规则四舍五入到分
+    up = nxt_open >= limit_price(c, limit, True) - limit_margin(c)
     return nxt_open.notna() & c.notna() & ~up
 
 
@@ -116,7 +116,11 @@ def _f_vol20(P):
 @factor("max_ret_20", "20日内最大单日涨幅", direction=-1,
         note="彩票效应：博弈性强的股票长期跑输")
 def _f_max20(P):
-    return P["pct_chg"].rolling(20).max()
+    # 由收盘价现算，不读库里的 pct_chg（理由见 strategies.builtin.Defensive.prepare）。
+    # 先 ffill 再算：停牌之后的第一天要和停牌前最后一个收盘比，与交易所口径一致
+    c = P["close"]
+    ret = (c.ffill().pct_change(fill_method=None) * 100).where(c.notna())
+    return ret.rolling(20).max()
 
 
 @factor("amihud", "Amihud非流动性", direction=-1,

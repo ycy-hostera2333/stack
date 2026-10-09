@@ -38,13 +38,21 @@ class MaTrend(Strategy):
     }
 
     def validate(self) -> None:
+        # 只挡「永远不会触发」的组合：周期非正，或相邻两条是同一条均线
+        # （MA20 > MA20 恒不成立）。快 > 中、中 > 慢这类反序组合虽然不是常规的
+        # 多头排列，但照样会出信号，老版本里也能跑——模拟盘账户会把参数一起存下来，
+        # 这里收紧的话，用这类参数建的老账户从此每次推进都会报错。
         p = self.params
-        if not (0 < int(p["ma_fast"]) < int(p["ma_mid"]) < int(p["ma_slow"])):
-            raise ValueError(f"均线周期须满足 快线({p['ma_fast']}) < 中线({p['ma_mid']}) "
-                             f"< 慢线({p['ma_slow']})，否则「多头排列」永远不成立")
+        f, m, s = int(p["ma_fast"]), int(p["ma_mid"]), int(p["ma_slow"])
+        if min(f, m, s) <= 0:
+            raise ValueError("均线周期必须是正数")
+        if f == m or m == s:
+            raise ValueError(f"快线({f})/中线({m})/慢线({s}) 有两条是同一条均线，"
+                             "「快 > 中 > 慢」永远不成立。常规取法是 快 < 中 < 慢")
 
     def warmup_bars(self) -> int:
-        return max(int(self.params["ma_slow"]) + 5, 60) + 30
+        p = self.params      # 反序组合也允许（见 validate），所以取三者最大
+        return max(int(p["ma_fast"]), int(p["ma_mid"]), int(p["ma_slow"]) + 5, 60) + 30
 
     def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
         p = self.params
@@ -457,9 +465,13 @@ class Defensive(Strategy):
 
     def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
         df = super().prepare(df)
-        # 近 20 日最大单日涨幅：彩票效应代理
-        df["max_ret20"] = df["pct_chg"].rolling(20, min_periods=20).max()
-        return df
+        # 近 20 日最大单日涨幅：彩票效应代理。
+        # 涨幅由前复权收盘价现算，不读库里的 pct_chg 列：增量同步曾经每次都把
+        # 重叠窗口第一天的 pct_chg 写成空，20 日窗口里有一个空值整段就是 NaN，
+        # entry 恒为 False——库保持每日同步的话，这个策略就再也不买任何股票。
+        ret = df["close"].pct_change(fill_method=None) * 100
+        return pd.concat([df, pd.DataFrame(
+            {"max_ret20": ret.rolling(20, min_periods=20).max()}, index=df.index)], axis=1)
 
     def entry(self, df: pd.DataFrame) -> pd.Series:
         p = self.params

@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+# ↑ 别删：pip 24 及更早的版本按系统编码读这个文件，中文 Windows 上是 GBK，
+#   下面的中文注释会让 pip install -r 直接报 UnicodeDecodeError。
 # A股选股与信号辅助系统 —— 运行依赖
 #
 # 安装：

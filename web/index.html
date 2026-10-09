@@ -588,7 +588,7 @@ function collectParams(prefix){
   return out;
 }
 
-/* 策略说明：有的策略把整段研究记录写在说明里（growth_value 有两千多字），
+/* 策略说明：有的策略把整段研究记录写在说明里（growth_value 有一千五百字），
    全文铺开会把表单下面整屏占满。默认只露第一行，点开看全文。 */
 function descHtml(d){
   d = String(d || '');
@@ -1210,10 +1210,15 @@ async function loadDecay(days){
       所有等长窗口的分布里排位。${verdict}<br>
       这不是「模拟盘对回测」的校验——那两者在同一区间上逐笔相等（自检有专门一项盯着），
       相减恒为零。这里问的是另一件事：策略是不是已经不灵了。</div></div>`;
-  }catch(e){ $('#pp-bar').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+  }catch(e){ box.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
 }
 
-$('#pp-acct').onchange = e => { PP.acct = e.target.value; renderPaperBar(); loadPaperAccount(); };
+$('#pp-acct').onchange = e => {
+  PP.acct = e.target.value; renderPaperBar();
+  // 不接住的话，切账户时接口出错只会在控制台里留一条 unhandled rejection，页面上什么都不显示
+  loadPaperAccount().catch(err =>
+    $('#pp-out').innerHTML = `<div class="err">${esc(err.message)}</div>`);
+};
 $('#pp-toggle-new').onclick = () => {
   const box = $('#pp-new');
   box.style.display = box.style.display==='none' ? 'block' : 'none';
@@ -1492,6 +1497,8 @@ function renderLabLists(){
       + mine.map(s=>`<tr><td class="code">${esc(s.name)}</td>
           <td>${esc(s.label)}${s.load_error
             ? `<br><span class="warntx">加载失败：${esc(s.load_error)}</span>`
+            : s.load_warning
+            ? `<br><span class="warntx">已加载，但在合成行情上试跑出错（多半不会出信号）：${esc(s.load_warning)}</span>`
             : `<br><span class="dim" style="font-size:12px">${esc((s.description||'').slice(0,60))}</span>`}</td>
           <td class="num dim">${s.lines ?? '—'}</td>
           <td class="dim">${esc(s.updated_at || '—')}</td>

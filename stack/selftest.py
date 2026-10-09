@@ -90,16 +90,20 @@ def _t_cost():
     assert price_limit("600519") == 0.10 and price_limit("300750") == 0.20
     assert price_limit("600519", "ST某某") == 0.05, "主板 ST 涨跌停应为 5%"
     assert price_limit("300750", "ST某某") == 0.20, "创业板 ST 仍为 20%"
-    # 涨跌停价四舍五入到分：前收 10.13 的涨停价是 11.14（不是 11.143），
+    # 涨跌停价按交易所规则四舍五入到分：前收 10.13 的涨停价是 11.14（不是 11.143），
     # 跌停价是 9.12（不是 9.117）。容差曾是 1e-6，这一半的涨跌停判不出来，
-    # 回测照样在一字板上成交。反过来也不能把差一两分的正常开盘当成涨停。
-    assert hit_limit_up(11.14, 10.13, 0.10), "向下取整的涨停价没有判成涨停"
-    assert hit_limit_up(11.15, 10.14, 0.10), "向上取整的涨停价没有判成涨停"
-    assert hit_limit_down(9.12, 10.13, 0.10), "向上取整的跌停价没有判成跌停"
-    assert hit_limit_up(24.31, 20.26, 0.20), "20% 板的涨停价没有判成涨停"
-    assert not hit_limit_up(11.12, 10.13, 0.10), "离涨停差两分的开盘被当成了涨停"
-    assert not hit_limit_up(2.19, 2.00, 0.10), "低价股差一分的开盘被当成了涨停"
-    assert not hit_limit_down(9.14, 10.13, 0.10), "离跌停差两分的开盘被当成了跌停"
+    # 回测照样在一字板上成交。反过来，差一分的正常开盘也绝不能被当成涨跌停——
+    # 曾经的容差是「未取整价 − 一分钱」，涨停价向上取整时，差一分的开盘照样被挡掉。
+    for px, pc, lim in ((11.14, 10.13, .10), (11.17, 10.15, .10), (11.00, 10.00, .10),
+                        (24.31, 20.26, .20), (0.70, 0.64, .10), (5.25, 5.00, .05)):
+        assert hit_limit_up(px, pc, lim), f"前收 {pc} 开 {px} 是涨停，没判出来"
+    for px, pc, lim in ((11.13, 10.13, .10), (11.16, 10.15, .10), (10.99, 10.00, .10),
+                        (5.49, 5.00, .10), (24.30, 20.26, .20), (0.69, 0.64, .10)):
+        assert not hit_limit_up(px, pc, lim), f"前收 {pc} 开 {px} 差一分到涨停，被当成了涨停"
+    for px, pc, lim in ((9.12, 10.13, .10), (9.14, 10.16, .10), (9.00, 10.00, .10)):
+        assert hit_limit_down(px, pc, lim), f"前收 {pc} 开 {px} 是跌停，没判出来"
+    for px, pc, lim in ((9.13, 10.13, .10), (9.15, 10.16, .10), (9.01, 10.00, .10)):
+        assert not hit_limit_down(px, pc, lim), f"前收 {pc} 开 {px} 差一分到跌停，被当成了跌停"
     return "含 ST/板块涨跌停、涨跌停价舍入到分"
 
 
@@ -331,7 +335,7 @@ def _t_suspend_value():
     pick = None
     for code, g in raw.groupby("code"):
         idx = [pos[d] for d in g["date"].dt.strftime("%Y-%m-%d") if d in pos]
-        gaps = [(a, b) for a, b in zip(idx, idx[1:]) if b - a > 1 and a >= 40]
+        gaps = [(a, b) for a, b in zip(idx, idx[1:]) if b - a > 1 and a >= 40 and b + 3 < len(days)]
         if gaps:
             pick = (code, gaps[0])
             break
@@ -406,12 +410,19 @@ def _paper_vs_engine(strategy: str, params: dict, cfg: engine.BacktestConfig,
                              params=(SELFTEST_ACCOUNT,))
             pe = pd.read_sql("SELECT date,equity FROM paper_equity WHERE account=?",
                              c, params=(SELFTEST_ACCOUNT,))
+        pst = paper.status(SELFTEST_ACCOUNT)
     finally:
         uni_mod.build = orig
 
     et = pd.DataFrame([{"code": t.code, "open_date": t.open_date,
                         "close_date": t.close_date, "shares": t.shares,
                         "pnl": round(t.pnl, 2)} for t in r.trades])
+    # 基准也要同一起点：引擎以首个信号日收盘为基期，模拟盘以首个推进日的前一交易日
+    # 收盘为基期——引擎提前一天开跑，这两天是同一天，基准收益必须相等
+    eb, pb = r.metrics.get("benchmark_return"), pst.get("benchmark_return")
+    if eb is not None and pb is not None:
+        assert abs(eb - pb) < 1e-4, (
+            f"{strategy} 基准收益不一致：引擎 {eb:+.4%}，模拟盘 {pb:+.4%}——起点差了一天")
     # 成交一致还不够：持仓怎么估值（停牌按什么价）只体现在净值上
     if not pe.empty and not r.equity.empty:
         m = pe.merge(r.equity[["date", "equity"]], on="date", suffixes=("_p", "_e"))
@@ -876,6 +887,27 @@ class SelftestLab(Strategy):
     return "进注册表、副本不顶掉内置、行号/前视/返回值/参数四类都拦得住"
 
 
+@check("自定义策略：继承内置策略的子类不能连带继承它的精简指标集")
+def _t_user_subclass():
+    """内置策略为了快，各自声明只算哪几列（Strategy.indicators）。用户代码直接
+    继承某个内置策略、又用了别的指标列时，若把这份声明一起继承下来，子类就
+    KeyError——被引擎吞掉，表现为「从此不出信号」，而且是在升级之后悄悄发生。"""
+    from .strategies import user as um
+
+    code = '''
+from stack.strategies.builtin import MaTrend
+
+class SelftestSub(MaTrend):
+    def entry(self, df):
+        return safe(super().entry(df) & (df["rsi14"] < 80) & (df["ma120"] > 0))
+'''
+    cls = um.compile_code(code, "selftest_sub")
+    assert cls.indicators is None, f"子类继承了精简指标集 {cls.indicators}"
+    out = um._run_signals(cls(), um.sample_df())     # 抛异常就是不通过
+    assert len(out["entry"]) == len(um.sample_df())
+    return "子类恢复为全量指标，用到 rsi14/ma120 照常出信号"
+
+
 @check("打分：打分型策略在模拟盘与每日信号里都必须真正打分")
 def _t_score_spread():
     """score_fields 类策略的 score() 是占位符，真正的横截面合成要在
@@ -1166,6 +1198,133 @@ def _t_baostock_norm():
     assert np.allclose(got["amount"], exp_amt), "amount 没按腾讯估算式重算"
     assert abs(got["pct_chg"].iloc[1] - (10.3 / 10.1 - 1) * 100) < 1e-9
     return "volume ÷100、amount 同口径、停牌行已去掉"
+
+
+@check("模拟盘：停牌超过取数窗口（或已退市）的持仓按最后收盘价计价")
+def _t_paper_long_suspend():
+    """模拟盘每天只取约 600 天的 K 线，而且原来不足 130 根的股票整只丢掉。
+    停牌一年多、或已经退市的持仓掉出窗口之后，计价就退回成本价，
+    和引擎（一直记着最后收盘价）对不上，前向记录凭空跳一下。"""
+    from . import paper
+
+    days = store.trading_days()
+    complete = store.last_complete_day()
+    if not complete or len(days) < 300:
+        return "跳过：交易日不足"
+    cutoff = (pd.Timestamp(complete) - pd.Timedelta(days=700)).strftime("%Y-%m-%d")
+    with store.connect() as c:
+        row = c.execute(
+            "SELECT code, MAX(date) d FROM daily WHERE code NOT LIKE 'IDX%' "
+            "GROUP BY code HAVING d < ? ORDER BY d DESC LIMIT 1", (cutoff,)).fetchone()
+        if not row:
+            return "跳过：库里没有停牌/退市超过窗口的股票"
+        code = row[0]
+        last = c.execute("SELECT close FROM daily WHERE code=? AND close>0 "
+                         "ORDER BY date DESC LIMIT 1", (code,)).fetchone()[0]
+    acct = "__selftest_susp__"
+    try:
+        # 仓位数 1，这笔构造的持仓占满了，当天不会再买别的：净值 - 现金只剩这一只
+        paper.reset("ma_cross", {}, 100_000, 1, 50, 0, account=acct)
+        cost = float(last) * 1.5             # 成本和最后收盘价故意不同
+        with store.connect() as c:
+            c.execute("INSERT INTO paper_holding (account,code,name,shares,cost,"
+                      "open_date,open_reason,peak,hold_days) VALUES (?,?,?,?,?,?,?,?,0)",
+                      (acct, code, code, 1000, cost, row[1], "构造", cost))
+        ev = paper.advance(as_of=complete, verbose=False, account=acct)
+        assert not ev.get("skipped"), ev.get("skipped")
+        assert not ev["sells"], f"{code} 已停牌/退市，却被卖掉了"
+        assert not ev["buys"], "仓位已满，不该再买入"
+        with store.connect() as c:
+            eq, cash = c.execute("SELECT equity, cash FROM paper_equity WHERE account=? "
+                                 "AND date=?", (acct, complete)).fetchone()
+        held = 1000 * float(last)
+        assert abs((eq - cash) - held) < 0.02, (
+            f"{code} 最后收盘 {last}，持仓应计 {held:,.2f}，实际计入 {eq - cash:,.2f}"
+            f"（按成本价是 {1000 * cost:,.2f}）")
+    finally:
+        paper.drop_account(acct)
+    return f"{code}（最后交易日 {row[1]}）按最后收盘 {last:.2f} 计价，不是成本价"
+
+
+@check("同步：增量写入不能把已有的涨跌幅覆盖成空，老库里的空洞能补上")
+def _t_keep_pct_chg():
+    """腾讯源的 pct_chg 由收盘价现算，抓回来那段第一行必然为空。增量同步每次往回
+    重抓 7 天、整行覆盖，于是每同步一次，重叠窗口第一天的涨跌幅就被写成空——
+    defensive 的「近 20 日最大单日涨幅」遇到一个空值就整段失效，从此不再买入。"""
+    code = "__SELFTEST_PCT__"
+    rows = pd.DataFrame({"code": code, "date": ["2020-01-02", "2020-01-03", "2020-01-06"],
+                         "open": 10.0, "high": 11.0, "low": 9.5,
+                         "close": [10.0, 10.5, 10.29], "volume": 1.0, "amount": 1.0,
+                         "pct_chg": [None, 5.0, -2.0], "turnover": None})
+    try:
+        store.upsert_daily(rows)
+        again = rows.iloc[1:].copy()
+        again["pct_chg"] = [None, -2.0]      # 新抓的这一段，第一行为空
+        store.upsert_daily(again)
+        with store.connect() as c:
+            v = c.execute("SELECT pct_chg FROM daily WHERE code=? AND date='2020-01-03'",
+                          (code,)).fetchone()[0]
+            assert v == 5.0, f"已有的涨跌幅 5.0 被增量写入覆盖成了 {v}"
+            c.execute("UPDATE daily SET pct_chg=NULL WHERE code=?", (code,))
+        n = store.repair_pct_chg([code])
+        with store.connect() as c:
+            got = [r[0] for r in c.execute("SELECT pct_chg FROM daily WHERE code=? "
+                                           "ORDER BY date", (code,))]
+        assert got[0] is None, "上市第一天没有前收，不该被补出数来"
+        assert abs(got[1] - 5.0) < 1e-9 and abs(got[2] - (-2.0)) < 1e-9, (
+            f"补出来的涨跌幅不对：{got}")
+        assert n == 2, f"应补 2 行，实际 {n}"
+    finally:
+        with store.connect() as c:
+            c.execute("DELETE FROM daily WHERE code=?", (code,))
+    return "重叠窗口首行的空值不再覆盖原值；空洞按收盘价补回，首日留空"
+
+
+@check("缓存：别的连接写入之后，行情与交易日历缓存必须立刻失效")
+def _t_cache_invalidate():
+    """行情读取按 PRAGMA data_version 缓存。写入发生在别的连接（命令行同步、
+    另一个线程）上时，版本号必须变；监视连接出错重建之后，也不能把新连接的
+    计数器和旧缓存的标签拿来比。"""
+    import sqlite3
+
+    from .config import DB_PATH
+
+    uni = universe.build()
+    codes = uni["code"].tolist()[:store._CACHE_MIN_CODES]
+    if len(codes) < store._CACHE_MIN_CODES:
+        return "跳过：股票池不足以触发缓存"
+    day = store.last_complete_day()
+    fake = "__SELFTEST_CACHE__"
+    try:
+        n0 = len(store.load_daily(codes + [fake], start=day, end=day))
+        c = sqlite3.connect(DB_PATH)
+        c.execute("INSERT INTO daily (code,date,open,high,low,close) VALUES (?,?,1,1,1,1)",
+                  (fake, day))
+        c.commit()
+        n1 = len(store.load_daily(codes + [fake], start=day, end=day))
+        assert n1 == n0 + 1, f"别的连接插入一行之后，缓存仍返回旧数据（{n0} -> {n1}）"
+        # 监视连接出错重建：新连接的计数器从头数起。故意让它一路数到旧缓存的标签，
+        # 再去读——标签里不带「第几条连接」的话，这时就会命中那份过期数据
+        key = (tuple(codes + [fake]), day, day)
+        tag = store._daily_cache[key][0]
+        store._watch["conn"].close()
+        store.data_version()
+        c.execute("DELETE FROM daily WHERE code=?", (fake,))
+        c.commit()
+        for i in range(12):
+            if store.data_version() == tag:
+                break
+            c.execute("INSERT OR REPLACE INTO meta (key,value) VALUES "
+                      "('__selftest_bump__', ?)", (str(i),))
+            c.commit()
+        c.close()
+        n2 = len(store.load_daily(codes + [fake], start=day, end=day))
+        assert n2 == n0, f"监视连接重建之后读到了旧缓存（应为 {n0}，实际 {n2}）"
+    finally:
+        with store.connect() as c:
+            c.execute("DELETE FROM daily WHERE code=?", (fake,))
+            c.execute("DELETE FROM meta WHERE key='__selftest_bump__'")
+    return "跨连接写入、监视连接重建两种情况都能失效"
 
 
 @check("同步：取消信号在一轮进行中也能叫停，不再发出请求")

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import bisect
+import os
 import sqlite3
 import threading
 from collections import OrderedDict
@@ -124,24 +125,55 @@ def connect():
 # 只要**任何其他连接**（包括别的进程，比如另开的命令行同步）提交过写入，
 # 返回值就会变。比文件修改时间可靠——WAL 文件在检查点之后是原地覆写的，
 # 大小不变，修改时间在一些文件系统上又只有毫秒级精度。
+#
+# data_version 的数值只在**同一条连接**内有意义：换一条新连接它会从头数起，
+# 可能恰好数回某条旧缓存的标签。所以版本号是 (代次, data_version)，每开一条
+# 新的监视连接代次加一，新旧连接的数永远不会被拿来比较。
+# 库文件被整个换掉（恢复备份、拷来别的机器上的库）时，POSIX 上旧连接还开着旧文件，
+# data_version 永远不变也不报错——所以每次还要比一下文件身份 (st_dev, st_ino)。
+# （Windows 上这条常驻连接会占着 market.db，服务运行期间删不掉、换不了它。）
 _watch_lock = threading.Lock()
-_watch: dict = {"conn": None}
+_watch: dict = {"conn": None, "gen": 0, "ident": None}
 
 
-def data_version() -> int:
-    """库内容的版本号：任何连接提交写入后都会变。只用来判断缓存是否过期。"""
-    with _watch_lock:
-        c = _watch["conn"]
-        if c is None:
-            c = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-            _watch["conn"] = c
+def _file_ident():
+    try:
+        st = os.stat(DB_PATH)
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return None
+
+
+def _drop_watch() -> None:
+    c = _watch["conn"]
+    _watch["conn"] = None
+    if c is not None:
         try:
-            return int(c.execute("PRAGMA data_version").fetchone()[0])
-        except sqlite3.Error:
-            # 库文件被换掉之类的异常情况：丢掉这条连接，本次视为「已变化」
-            _watch["conn"] = None
             c.close()
-            return -1
+        except sqlite3.Error:
+            pass
+
+
+def data_version() -> tuple | None:
+    """库内容的版本号：任何连接提交写入后都会变。只用来判断缓存是否过期。
+
+    返回 None 表示这次判断不了，调用方不能用缓存、也不该写缓存。
+    """
+    with _watch_lock:
+        if _watch["conn"] is not None and _file_ident() != _watch["ident"]:
+            _drop_watch()                    # 文件被换掉了
+        if _watch["conn"] is None:
+            try:
+                c = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+            except sqlite3.Error:
+                return None
+            _watch.update(conn=c, gen=_watch["gen"] + 1, ident=_file_ident())
+        try:
+            dv = int(_watch["conn"].execute("PRAGMA data_version").fetchone()[0])
+        except sqlite3.Error:
+            _drop_watch()
+            return None
+        return (_watch["gen"], dv)
 
 
 _CACHE_MAX = 2                 # 一份全市场日线约 100+MB，只留最近两份
@@ -217,20 +249,61 @@ def upsert_instruments(df: pd.DataFrame) -> int:
     return len(df)
 
 
+# 新数据里为空时保留库里原值的列。腾讯/BaoStock 的 pct_chg 是由收盘价现算的，
+# 抓回来那一段的第一行必然是空；增量同步每次往回重抓 7 天、整行覆盖，于是每同步
+# 一次，重叠窗口第一天原本好好的涨跌幅就被写成空，日积月累。
+_KEEP_IF_NULL = ("amount", "pct_chg", "turnover")
+
+
 def upsert_daily(df: pd.DataFrame) -> int:
-    """写入日线。重复的 (code,date) 覆盖，便于修正复权后的历史价格。"""
+    """写入日线。重复的 (code,date) 覆盖，便于修正复权后的历史价格。
+
+    价格、成交量整行以新数据为准；_KEEP_IF_NULL 里的列新数据为空时保留原值。
+    """
     if df is None or df.empty:
         return 0
     cols = ["code", "date", "open", "high", "low", "close",
             "volume", "amount", "pct_chg", "turnover"]
     df = df.reindex(columns=cols)
+    sets = ", ".join(
+        f"{c}=COALESCE(excluded.{c}, daily.{c})" if c in _KEEP_IF_NULL
+        else f"{c}=excluded.{c}" for c in cols[2:])
     with connect() as conn:
         conn.executemany(
-            f"INSERT OR REPLACE INTO daily ({','.join(cols)}) "
-            f"VALUES ({','.join('?' * len(cols))})",
+            f"INSERT INTO daily ({','.join(cols)}) "
+            f"VALUES ({','.join('?' * len(cols))}) "
+            f"ON CONFLICT(code, date) DO UPDATE SET {sets}",
             _rows(df),
         )
     return len(df)
+
+
+def repair_pct_chg(codes: Sequence[str] | None = None) -> int:
+    """把 pct_chg 为空、前一根收盘价已知的行补上（前复权收盘价的日涨幅）。
+
+    补的是增量同步留下的空洞（见 _KEEP_IF_NULL）。逐只股票各开一个事务：
+    一条 UPDATE 扫全表会长时间占着写锁，模拟盘推进等 30 秒就会报「database is locked」。
+    每只股票上市第一天本来就没有前收，留空。返回补上的行数。
+    """
+    with connect() as conn:
+        if codes is None:
+            codes = [r[0] for r in conn.execute(
+                "SELECT DISTINCT code FROM daily WHERE pct_chg IS NULL "
+                "AND code NOT LIKE 'IDX%'")]
+    n = 0
+    for code in codes:
+        with connect() as conn:
+            cur = conn.execute("""
+                UPDATE daily SET pct_chg = (
+                    SELECT (daily.close / p.close - 1) * 100 FROM daily AS p
+                    WHERE p.code = daily.code AND p.date < daily.date
+                    ORDER BY p.date DESC LIMIT 1)
+                WHERE code = ? AND pct_chg IS NULL AND close > 0
+                  AND (SELECT p.close FROM daily AS p
+                       WHERE p.code = daily.code AND p.date < daily.date
+                       ORDER BY p.date DESC LIMIT 1) > 0""", (code,))
+            n += max(cur.rowcount, 0)
+    return n
 
 
 def replace_daily(code: str, df: pd.DataFrame) -> int:
@@ -341,12 +414,12 @@ def load_daily(
         ver = data_version()
         with _cache_lock:
             hit = _daily_cache.get(key)
-            if hit is not None and hit[0] == ver and ver >= 0:
+            if hit is not None and ver is not None and hit[0] == ver:
                 _daily_cache.move_to_end(key)
                 # 给副本：调用方可以随意改列（api 的回放接口就会改 date 列）
                 return hit[1].copy()
     df = _load_daily_sql(codes, start, end)
-    if big and ver >= 0:
+    if big and ver is not None:
         with _cache_lock:
             _daily_cache[key] = (ver, df)
             _daily_cache.move_to_end(key)
@@ -465,7 +538,7 @@ def last_complete_day(min_ratio: float = COMPLETE_RATIO,
     ver = data_version()
     with _cache_lock:
         hit = _days_cache.get(key)
-        if hit is not None and hit[0] == ver and ver >= 0:
+        if hit is not None and ver is not None and hit[0] == ver:
             return hit[1]
     with connect() as conn:
         rows = conn.execute(
@@ -486,7 +559,7 @@ def trading_days(start: str | None = None, end: str | None = None) -> list[str]:
     ver = data_version()
     with _cache_lock:
         hit = _days_cache.get("days")
-    if hit is None or hit[0] != ver or ver < 0:
+    if hit is None or ver is None or hit[0] != ver:
         with connect() as conn:
             days = [r[0] for r in conn.execute(
                 "SELECT DISTINCT date FROM daily ORDER BY date").fetchall()]

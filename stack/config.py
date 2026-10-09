@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "market.db"
@@ -50,26 +52,41 @@ def price_limit(code: str, name: str = "") -> float:
     return limit
 
 
-# 涨跌停判定的容差。交易所的涨跌停价是「前收 ×(1±幅度)」四舍五入到分：
-# 前收 10.13 的涨停价是 11.14，不是 11.143。早先用 1e-6 的容差去比，
-# 凡是向下取整的涨停（约一半）都判不出来，回测照样在一字板上「买到」，
-# 结果系统性偏乐观；行情源给的前复权价本身也只到分，两头各有半分的舍入。
-# 所以容差取一分钱；低价股不超过前收的 0.5%，免得把 +9% 的开盘也当成涨停。
-LIMIT_TICK = 0.01
+# 涨跌停判定。交易所的涨跌停价是「前收 ×(1±幅度)」**四舍五入到分**：
+# 前收 10.13 的涨停价是 11.14，不是 11.143。早先拿未取整的 前收×1.1 去比、容差 1e-6，
+# 凡是向下取整的涨停（约一半）都判不出来，回测照样在一字板上「买到」，系统性偏乐观。
+#
+# 现在先按交易所规则算出涨跌停价，再留一点余量去比：
+#   · 余量略小于一分钱（LIMIT_MARGIN）：原始价上，差一分的正常开盘（如前收 10.00、
+#     开 10.99）绝不会被当成涨停，真正的涨停一个不漏；
+#   · 前复权的历史价是「原始价 × 复权因子」再取到分，和按复权价算出的涨停价能差出
+#     一分左右，这点余量正好兜住；
+#   · 低价股的余量不超过前收的 0.5%，免得把 +9.5% 的开盘也当成涨停。
+LIMIT_MARGIN = 0.0099
 
 
-def _limit_tol(prev_close: float) -> float:
-    return min(LIMIT_TICK, 0.005 * prev_close)
+def limit_price(prev_close, limit, up: bool = True):
+    """交易所口径的涨/跌停价：前收 ×(1±幅度)，四舍五入（half-up）到分。
+
+    标量、numpy 数组、pandas 对象都能用。加一个极小量是为了抵消二进制浮点的误差：
+    10.15×1.1 在浮点里可能是 11.164999…，按交易所口径它是 11.165，应当进位到 11.17。
+    """
+    raw = prev_close * (1 + limit) if up else prev_close * (1 - limit)
+    return np.floor(raw * 100 + 0.5 + 1e-6) / 100
+
+
+def limit_margin(prev_close):
+    return np.minimum(LIMIT_MARGIN, 0.005 * prev_close)
 
 
 def hit_limit_up(px: float, prev_close: float, limit: float) -> bool:
     """以 px 成交是否撞在涨停价上（开盘一字涨停视为买不进）。"""
-    return px >= prev_close * (1 + limit) - _limit_tol(prev_close)
+    return bool(px >= limit_price(prev_close, limit, True) - limit_margin(prev_close))
 
 
 def hit_limit_down(px: float, prev_close: float, limit: float) -> bool:
     """以 px 成交是否撞在跌停价上（开盘一字跌停视为卖不出）。"""
-    return px <= prev_close * (1 - limit) + _limit_tol(prev_close)
+    return bool(px <= limit_price(prev_close, limit, False) + limit_margin(prev_close))
 
 
 def buy_cost(amount: float) -> float:

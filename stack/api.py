@@ -182,6 +182,7 @@ async def strategies():
         s["updated_at"] = row.get("updated_at")
         s["lines"] = row.get("lines") if row else None
         s["load_error"] = row.get("load_error") or user_mod.load_errors.get(s["name"])
+        s["load_warning"] = user_mod.load_warnings.get(s["name"])
         s["created_at"] = row.get("created_at")
     return _clean(out)
 
@@ -722,6 +723,13 @@ def _do_create_account(req: PaperAccountReq) -> None:
 
     try:
         with _paper_lock:                    # 与守护线程的推进互斥，见 _paper_lock
+            # 拿到锁之后再确认一次：命令行可能在 HTTP 检查之后建了同名账户，
+            # 这里 reset 下去就会清掉它的前向记录
+            if paper.status(req.account).get("strategy"):
+                _paper_daemon["creating"] = {
+                    "account": req.account, "phase": "失败",
+                    "error": f"账户 {req.account} 已存在，未做任何改动"}
+                return
             _paper_daemon["creating"]["phase"] = "建立账户"
             paper.reset(req.strategy, req.params, req.cash, req.max_positions,
                         req.top, req.max_hold_days, account=req.account,
@@ -781,13 +789,19 @@ async def paper_create(req: PaperAccountReq):
     cur = _paper_daemon.get("creating")
     if cur and cur.get("phase") not in ("完成", "失败", None):
         raise HTTPException(409, f"正在建立账户 {cur['account']}，请稍候")
-    if (await _run(paper.status, req.account)).get("strategy"):
-        raise HTTPException(409, f"账户 {req.account} 已存在。"
-                                 "重置会清空它已积累的前向记录，请先删除再建。")
-    # 在请求线程里就占住「正在建立」：放到后台任务里再置位的话，
-    # 连点两下会在它置位之前通过上面的检查，建出两个回补任务
+    # 检查和占位之间不能有 await：两个 await 之间的代码在事件循环里是原子的，
+    # 中间一旦让出控制权，第二个请求就能在占位之前通过上面的检查，建出两个回补任务
     _paper_daemon["creating"] = {"account": req.account, "phase": "等待守护线程",
                                  "done": 0, "total": 0}
+    try:
+        exists = (await _run(paper.status, req.account)).get("strategy")
+    except Exception:
+        _paper_daemon["creating"] = cur
+        raise
+    if exists:
+        _paper_daemon["creating"] = cur
+        raise HTTPException(409, f"账户 {req.account} 已存在。"
+                                 "重置会清空它已积累的前向记录，请先删除再建。")
     asyncio.get_running_loop().run_in_executor(None, _do_create_account, req)
     return {"started": True, "account": req.account}
 
